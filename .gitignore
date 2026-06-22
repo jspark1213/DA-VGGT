@@ -1,0 +1,11 @@
+# Reference paper
+ECCV_2026_SVGGT.pdf
+
+# Test source
+err.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# Not be committed
