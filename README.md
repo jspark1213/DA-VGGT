@@ -1,4 +1,4 @@
-# DA-VGGT
+<h1 align="center">Diversity-Aware View Partitioning for Scalable VGGT</h1>
 
 <p align="center">
   <a href="#"><img src="https://img.shields.io/badge/arXiv-TBD-b31b1b?logo=arxiv&logoColor=white" alt="arXiv"></a>
@@ -17,8 +17,6 @@
   <sup>1</sup>POSTECH&nbsp;&nbsp; <sup>2</sup>GIST&nbsp;&nbsp; <sup>3</sup>KAIST&nbsp;&nbsp; <sup>4</sup>RLWRLD
 </p>
 
-Official repository for **Diversity-Aware View Partitioning for Scalable VGGT**.
-
 DA-VGGT is a training-free, plug-and-play inference framework for VGGT that
 organizes input views into diversity-aware balanced subsets, constructed via
 combinatorial graph partitioning over visual dissimilarity and spatial
@@ -30,8 +28,8 @@ evaluations on 7-Scenes (pose, 3D) and Bonn (depth).
 
 ## News
 
-- **2026-06-17** — Accepted to **ECCV 2026** 🎉
-- **2026-06-22** — Code released.
+- **`2026-06-17`** — Accepted to **ECCV 2026** 🎉
+- **`2026-06-22`** — Code released.
 
 ## Layout
 
@@ -67,9 +65,9 @@ bash eval_3d_7scenes.sh      # 7-Scenes 3D reconstruction
 bash eval_depth_bonn.sh      # Bonn RGB-D depth
 ```
 
-Each script invokes the matching `eval/eval_chunked_*.py` with the main method
-`--sampling_method random_ls_revsim` and pose-weighted re-chunking
-(`--poseweight_mode pseudo`, `--combine_mode E`, `--gamma 0.001`,
+Each script invokes the matching `eval/eval_chunked_*.py` with our method
+`--sampling_method da_partitioning` (diversity-aware partitioning), which splits
+the views and applies pose-weighted re-chunking (`--gamma 0.001`,
 `--epsilon 0.005`, `--rechunk_remaining_only`).
 
 To run a script directly (e.g. for a custom config):
@@ -78,13 +76,55 @@ To run a script directly (e.g. for a custom config):
 python eval/eval_chunked_pose_7scenes.py \
     --dataset_dir /path/to/7scenes \
     --n_frames 500 --chunk_size 50 \
-    --sampling_method random_ls_revsim --local_search_iters 5 \
-    --poseweight_mode pseudo --rechunk_remaining_only \
+    --sampling_method da_partitioning --local_search_iters 5 \
+    --rechunk_remaining_only \
     --output_dir ./results/pose_7scenes
 ```
 
-`--sampling_method origin` (single-batch, no chunking) is available as a baseline
-in every script. See `python eval/<script>.py --help` for the full option list.
+Two baselines are available in every script: `--sampling_method
+random_partitioning` (random partitioning without local search) and `origin`
+(no partitioning — a single full-sequence pass). See `python eval/<script>.py
+--help` for the full option list.
+
+## Options
+
+The CLI is intentionally minimal — only the knobs needed to reproduce the paper
+are exposed. All three scripts share a common core; the 3D and depth scripts add
+a few task-specific options.
+
+**Common (all scripts)**
+
+| Argument | Default | Description |
+|---|---|---|
+| `--dataset_dir` | *(required)* | Dataset root |
+| `--n_frames` | `200` | Frames sampled per sequence |
+| `--chunk_size` | `50` | Max frames per chunk |
+| `--sampling_method` | `da_partitioning` | `da_partitioning` (ours), `random_partitioning` (random, no local search), or `origin` (no partitioning, single full pass) |
+| `--local_search_iters` | `5` | 2-opt local-search iterations (`da_partitioning` only) |
+| `--scenes` | all | Subset of scenes to evaluate |
+| `--model_path` | HF `facebook/VGGT-1B` | Custom checkpoint |
+| `--dtype` | `bfloat16` | `float32` / `bfloat16` / `float16` |
+| `--dino_batch_size` | `256` | DINOv2 mini-batch size |
+| `--seed` | `42` | Random seed |
+| `--output_dir` | `./results_*` | Output directory |
+
+**Pose-weighted re-chunking** — applied automatically for `--sampling_method da_partitioning`:
+
+| Argument | Default | Description |
+|---|---|---|
+| `--gamma` | `0.001` | Softmax temperature for pseudo-pose soft assignment |
+| `--tau` | auto | Pose-weight distance decay (auto = median pairwise distance) |
+| `--epsilon` | `0.005` | ε for the appearance−ε·pose score combination |
+| `--rechunk_remaining_only` | off | Freeze chunk-0 and re-chunk only the remaining frames |
+
+**3D-only** (`eval_chunked_3d_7scenes.py`): `--conf_thresh`, `--export_ply`, `--ply_dir`.
+**Depth-only** (`eval_chunked_depth_bonn.py`): `--min_depth`, `--max_depth`.
+
+Cross-chunk alignment is single-anchor rigid **SE3** (no scale). The
+score-combination and pseudo-pose pipeline have a single fixed configuration; the
+various ablation knobs used during development (alternative samplers, combine
+modes, multi-anchor / Sim3 alignment, oracle GT pose-weighting, τ/rotation
+sweeps) are not part of this release.
 
 ## Acknowledgements
 

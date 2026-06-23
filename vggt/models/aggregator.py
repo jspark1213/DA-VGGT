@@ -304,321 +304,31 @@ def compute_pose_weight_matrix(positions, tau=None):
     return W_pose, tau
 
 
-# ----------------------------------------------------------------------------
-# Rotation-aware extension (rebuttal ablation).
-#
-# Paper Eq.(5) propagates only translations. Reviewer asked whether including
-# rotation cues changes results. The helpers below let `run_inference_poseweight`
-# also propagate rotations from the seed chunk and build an SE(3) dispersion
-# matrix d_ij = ||Δt|| + α·θ.
-# ----------------------------------------------------------------------------
+def _combine_score_matrices(U_appearance, W_pose, epsilon=None):
+    """Combine appearance score matrix with the pose-weight matrix.
 
-def _weighted_quaternion_mean(quats, weights):
-    """Weighted quaternion mean via Markley's eigenvector method.
-
-    For unit quaternions q_i with weights w_i, the mean is the eigenvector of
-    the largest eigenvalue of M = Σ w_i q_i q_i^T (Markley 2007).
-    Robust to antipodal duplicates and weighted assignments.
-
-    Args:
-        quats:   (S, 4) numpy array of unit quaternions (any convention; consistent).
-        weights: (S,)   numpy array of non-negative weights, sum > 0.
-
-    Returns:
-        (4,) unit quaternion (same convention as input).
-    """
-    import numpy as np
-    q = np.asarray(quats, dtype=np.float64)            # (S, 4)
-    w = np.asarray(weights, dtype=np.float64).reshape(-1, 1)
-    M = (w * q).T @ q                                  # (4, 4)
-    eigvals, eigvecs = np.linalg.eigh(M)
-    qm = eigvecs[:, -1]
-    qm = qm / max(np.linalg.norm(qm), 1e-12)
-    return qm
-
-
-def compute_pseudo_rotations(chunk0_rotations, chunk0_indices, N, sim_matrix,
-                              gamma=1.0):
-    """Pseudo-rotations for all N frames via soft assignment from chunk 0.
-
-    Mirrors `compute_pseudo_poses` but on SO(3): for frame t ∉ chunk 0,
-        π_{t,a} = softmax_a(cos(f_t, f_a) / γ)
-        R̂_t    = WeightedQuatMean({R_a}_{a∈chunk0}, π_{t,·})
-
-    For t ∈ chunk 0: R̂_t = R_t (actual inferred rotation from VGGT).
-
-    Args:
-        chunk0_rotations: (S_k, 3, 3) numpy array of rotation matrices (w2c or c2w
-            — caller's convention; output keeps the same convention).
-        chunk0_indices:   list of int.
-        N:                total frames.
-        sim_matrix:       (N, N) numpy cosine similarity.
-        gamma:            softmax temperature (matches translation propagation).
-
-    Returns:
-        pseudo_rotations: (N, 3, 3) numpy float64.
-    """
-    import numpy as np
-    from vggt.utils.rotation import mat_to_quat, quat_to_mat
-    import torch as _torch
-
-    S_k = len(chunk0_indices)
-    pseudo_rot = np.zeros((N, 3, 3), dtype=np.float64)
-
-    chunk0_R = np.asarray(chunk0_rotations, dtype=np.float64)
-    chunk0_R_t = _torch.from_numpy(chunk0_R)
-    chunk0_quats = mat_to_quat(chunk0_R_t).cpu().numpy()  # (S_k, 4) ijkr
-
-    chunk0_set = set(chunk0_indices)
-    for local_idx, global_idx in enumerate(chunk0_indices):
-        pseudo_rot[global_idx] = chunk0_R[local_idx]
-
-    chunk0_arr = np.array(chunk0_indices, dtype=np.intp)
-    non_chunk0 = np.array([i for i in range(N) if i not in chunk0_set], dtype=np.intp)
-    if len(non_chunk0) == 0:
-        return pseudo_rot
-
-    sims = sim_matrix[non_chunk0][:, chunk0_arr] / gamma
-    sims -= sims.max(axis=1, keepdims=True)
-    weights = np.exp(sims)
-    weights /= weights.sum(axis=1, keepdims=True)        # (M, S_k)
-
-    # Per-frame Markley mean. M is small (≤ N ~ 500) so a Python loop is fine.
-    pseudo_quats = np.zeros((len(non_chunk0), 4), dtype=np.float64)
-    for j, w_row in enumerate(weights):
-        pseudo_quats[j] = _weighted_quaternion_mean(chunk0_quats, w_row)
-    pseudo_quats_t = _torch.from_numpy(pseudo_quats)
-    pseudo_R = quat_to_mat(pseudo_quats_t).cpu().numpy()  # (M, 3, 3)
-    pseudo_rot[non_chunk0] = pseudo_R
-
-    return pseudo_rot
-
-
-def _rotation_angles(R):
-    """Pairwise geodesic angles on SO(3): θ_ij = arccos((tr(R_i^T R_j) - 1)/2).
-
-    Args:
-        R: (N, 3, 3) numpy rotation matrices.
-
-    Returns:
-        (N, N) numpy float64, in [0, π], zero diagonal.
-    """
-    import numpy as np
-    Rt = np.transpose(R, (0, 2, 1))                       # (N, 3, 3)
-    # trace(R_i^T @ R_j) = sum_{a,b} R_i[b,a] R_j[b,a] = (R_i * R_j).sum() over (a,b)
-    # Pairwise: einsum('iba,jba->ij', R, R)  (since R_i^T[a,b] = R_i[b,a])
-    tr_ij = np.einsum('iba,jba->ij', R, R)
-    cos = np.clip((tr_ij - 1.0) / 2.0, -1.0, 1.0)
-    return np.arccos(cos)
-
-
-def compute_pseudo_focals(chunk0_focals, chunk0_indices, N, sim_matrix, gamma=1.0):
-    """Pseudo-focal-lengths via the same softmax-on-similarity rule as Eq.(5).
-
-    Args:
-        chunk0_focals: (S_k,) numpy array — predicted focal length per chunk0 frame
-            (typically mean of fx, fy from VGGT camera_head).
-        chunk0_indices: list of int.
-        N:              total frames.
-        sim_matrix:     (N, N) cosine similarity.
-        gamma:          softmax temperature (matches Eq.(5)).
-
-    Returns:
-        pseudo_focals: (N,) numpy float64.
-    """
-    import numpy as np
-
-    pseudo_f = np.zeros(N, dtype=np.float64)
-    chunk0_f = np.asarray(chunk0_focals, dtype=np.float64)
-    chunk0_set = set(chunk0_indices)
-    for li, gi in enumerate(chunk0_indices):
-        pseudo_f[gi] = chunk0_f[li]
-
-    chunk0_arr = np.array(chunk0_indices, dtype=np.intp)
-    non_chunk0 = np.array([i for i in range(N) if i not in chunk0_set], dtype=np.intp)
-    if len(non_chunk0) == 0:
-        return pseudo_f
-
-    sims = sim_matrix[non_chunk0][:, chunk0_arr] / gamma
-    sims -= sims.max(axis=1, keepdims=True)
-    weights = np.exp(sims)
-    weights /= weights.sum(axis=1, keepdims=True)         # (M, S_k)
-    pseudo_f[non_chunk0] = weights @ chunk0_f
-    return pseudo_f
-
-
-def compute_se3_pose_weight_matrix(positions, rotations=None, focals=None,
-                                    tau=None, alpha_rot=1.0, beta_focal=0.0,
-                                    mode="translation",
-                                    fair_normalize=True):
-    """SE(3) (+ optional intrinsics) pose-proximity weight matrix.
-
-    Base distance by `mode`:
-        'translation' : d_ij = ||Δt||              (paper baseline)
-        'additive'    : d_ij = ||Δt|| + α·θ_ij
-        'rotation'    : d_ij = α·θ_ij               (translation ignored)
-
-    Optional intrinsics term: if focals is not None and beta_focal > 0,
-        d_ij ← d_ij + β · |Δf_ij| / f̄,
-    where f̄ is the mean of all pseudo-focals (dimensionless normalization).
-
-    Fair scale normalization (fair_normalize=True, default for ablations):
-        Each component is divided by its own median pairwise value before being
-        summed, so α=β=1 corresponds to equal effective weight against the
-        translation term. Without this, ||Δt|| (scene units) dominates and
-        rotation/intrinsics terms contribute negligibly.
-
-    W_pose_ij = exp(-d_ij / τ), zero diagonal. τ defaults to median pairwise d.
-
-    Args:
-        positions:  (N, 3) numpy — pseudo-translations.
-        rotations:  (N, 3, 3) numpy — pseudo-rotations (required if mode≠'translation').
-        focals:     (N,) numpy — pseudo-focals (optional intrinsics cue).
-        tau:        distance decay; None ⇒ median(triu pairwise d).
-        alpha_rot:  scalar weighting θ (radians).
-        beta_focal: scalar weighting |Δf|/f̄ (dimensionless).
-        mode:       'translation' | 'additive' | 'rotation'.
-        fair_normalize: if True, normalize each component by its own median
-            before summation (default; needed for fair ablation).
-
-    Returns:
-        W_pose: (N, N) numpy float64.
-        tau_used: float.
-    """
-    import numpy as np
-
-    def _triu_median(x):
-        iu = np.triu_indices_from(x, k=1)
-        v = x[iu]
-        v = v[v > 0]
-        return float(np.median(v)) if len(v) else 1.0
-
-    def _triu_std(x):
-        v = x[np.triu_indices_from(x, k=1)]
-        v = v[v > 0]
-        return float(np.std(v)) if len(v) else 1.0
-
-    pos = np.asarray(positions, dtype=np.float64)
-    if mode == "translation":
-        diff = pos[:, None, :] - pos[None, :, :]
-        dists = np.linalg.norm(diff, axis=2)
-    else:
-        if rotations is None:
-            raise ValueError(f"mode={mode!r} requires rotations to be provided")
-        Rm = np.asarray(rotations, dtype=np.float64)
-        theta = _rotation_angles(Rm)                      # (N, N) radians
-        if mode == "additive":
-            diff = pos[:, None, :] - pos[None, :, :]
-            d_t = np.linalg.norm(diff, axis=2)
-            if fair_normalize:
-                med_t = max(_triu_median(d_t), 1e-8)
-                med_th = max(_triu_median(theta), 1e-8)
-                t_norm = d_t / med_t
-                r_norm = theta / med_th
-                # alpha_rot == None  -> adaptive std-matching: scale rotation so
-                # its dispersion (std on the normalized term) equals translation's.
-                if alpha_rot is None:
-                    alpha_eff = _triu_std(t_norm) / max(_triu_std(r_norm), 1e-8)
-                else:
-                    alpha_eff = float(alpha_rot)
-                print(f"    [se3_pose_weight additive] med_t={med_t:.6f} med_theta={med_th:.6f} "
-                      f"std(t_norm)={_triu_std(t_norm):.6f} std(r_norm)={_triu_std(r_norm):.6f} "
-                      f"alpha_eff={alpha_eff:.6f}")
-                dists = t_norm + alpha_eff * r_norm
-            else:
-                dists = d_t + (alpha_rot if alpha_rot is not None else 1.0) * theta
-        elif mode == "rotation":
-            if fair_normalize:
-                med_th = max(_triu_median(theta), 1e-8)
-                # alpha_rot has no scale ambiguity when translation is absent;
-                # use 1.0 (or user override) on the normalized term.
-                alpha_eff = 1.0 if alpha_rot is None else float(alpha_rot)
-                dists = alpha_eff * theta / med_th
-            else:
-                dists = (alpha_rot if alpha_rot is not None else 1.0) * theta
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
-
-    # Optional intrinsics term: scale-normalized focal-length difference.
-    if focals is not None and (beta_focal is None or beta_focal > 0):
-        f = np.asarray(focals, dtype=np.float64)
-        f_mean = max(float(f.mean()), 1e-8)
-        df = np.abs(f[:, None] - f[None, :]) / f_mean
-        if fair_normalize:
-            med_f = max(_triu_median(df), 1e-8)
-            df_norm = df / med_f
-            # beta_focal == None -> adaptive std-matching to translation term.
-            if beta_focal is None:
-                # reference std = std of pure-translation part of `dists` if
-                # available, else of df_norm itself (1.0).
-                if mode == "translation":
-                    ref_std = _triu_std(dists)
-                else:
-                    # Use the translation component pre-mix; falls back to dists std.
-                    ref_std = _triu_std(dists)
-                beta_eff = ref_std / max(_triu_std(df_norm), 1e-8)
-            else:
-                beta_eff = float(beta_focal)
-            dists = dists + beta_eff * df_norm
-        else:
-            beta_eff = float(beta_focal) if beta_focal is not None else 1.0
-            dists = dists + beta_eff * df
-
-    if tau is None:
-        nonzero = dists[np.triu_indices_from(dists, k=1)]
-        tau = float(np.median(nonzero)) if len(nonzero) > 0 else 1.0
-        tau = max(tau, 1e-8)
-
-    W_pose = np.exp(-dists / tau).astype(np.float64)
-    np.fill_diagonal(W_pose, 0.0)
-    return W_pose, tau
-
-
-def _combine_score_matrices(U_appearance, W_pose, combine_mode="A", alpha_combine=0.5,
-                            epsilon=None):
-    """Combine appearance score matrix with pose-weight matrix.
+    Combined score is U - ε·W: the appearance (reverse-similarity) score minus an
+    ε-scaled pose-proximity penalty, so the local search favors chunks that are
+    both appearance-diverse and spatially dispersed.
 
     Args:
         U_appearance: (N, N) numpy float64, appearance score (e.g. revsim).
         W_pose: (N, N) numpy float64, pose proximity weights.
-        combine_mode: "A" (linear), "B" (multiplicative), "C" (pose-only),
-                      "D" (U + ε·W), "E" (U - ε·W).
-        alpha_combine: mixing weight for mode A (weight on appearance side).
-        epsilon: fixed epsilon for mode D/E. If None, use adaptive (0.01 × std(U)/std(W)).
+        epsilon: fixed epsilon. If None, use adaptive (0.01 × std(U)/std(W)).
 
     Returns:
         U_combined: (N, N) numpy float64.
     """
     import numpy as np
 
-    if combine_mode == "A":
-        U_combined = alpha_combine * U_appearance + (1.0 - alpha_combine) * W_pose
-    elif combine_mode == "B":
-        U_combined = U_appearance * W_pose
-    elif combine_mode == "C":
-        # Pose-only DISPERSION (paper Eq.7 with δ removed).
-        # W_pose = exp(-||Δt||/τ) is a PROXIMITY matrix (close→large).
-        # paper's ρ_ij = 1 - exp(-||Δt||/τ) is dispersion (far→large), which
-        # is what the local search must MAXIMIZE for diversity.
-        U_combined = 1.0 - W_pose
-    elif combine_mode in ("D", "E"):
-        std_app = max(np.std(U_appearance[U_appearance > 0]), 1e-12)
-        std_pose = max(np.std(W_pose[W_pose > 0]), 1e-12)
-        adaptive_eps = 0.01 * std_app / std_pose
-        if epsilon is not None:
-            eps = epsilon
-        else:
-            eps = adaptive_eps
-        sign = "+" if combine_mode == "D" else "-"
-        print(f"    [combine] std(U)={std_app:.6f} std(W)={std_pose:.6f} "
-              f"std(U)/std(W)={std_app/std_pose:.6f} adaptive_eps={adaptive_eps:.8f} "
-              f"used_eps={eps} mode={sign}")
-        if combine_mode == "D":
-            U_combined = U_appearance + eps * W_pose
-        else:
-            U_combined = U_appearance - eps * W_pose
-    else:
-        raise ValueError(f"Unknown combine_mode: {combine_mode}")
+    std_app = max(np.std(U_appearance[U_appearance > 0]), 1e-12)
+    std_pose = max(np.std(W_pose[W_pose > 0]), 1e-12)
+    adaptive_eps = 0.01 * std_app / std_pose
+    eps = epsilon if epsilon is not None else adaptive_eps
+    print(f"    [combine] std(U)={std_app:.6f} std(W)={std_pose:.6f} "
+          f"std(U)/std(W)={std_app/std_pose:.6f} adaptive_eps={adaptive_eps:.8f} "
+          f"used_eps={eps}")
+    U_combined = U_appearance - eps * W_pose
 
     np.fill_diagonal(U_combined, 0.0)
     return U_combined
@@ -626,7 +336,6 @@ def _combine_score_matrices(U_appearance, W_pose, combine_mode="A", alpha_combin
 
 def rechunk_with_pose_weights(chunks, anchors, sim_matrix, W_pose,
                                score_type="revsim", alpha=0.0,
-                               combine_mode="A", alpha_combine=0.5,
                                n_anchors=1, local_search_iters=5,
                                epsilon=None, anchors_override=None):
     """Re-chunk using pose-weighted combined score for 2-opt local search.
@@ -634,7 +343,7 @@ def rechunk_with_pose_weights(chunks, anchors, sim_matrix, W_pose,
     Pipeline:
       1. Strip anchors from chunks
       2. Compute appearance score matrix U from sim_matrix
-      3. Combine U with W_pose via combine_mode
+      3. Combine U with W_pose (U - ε·W)
       4. Run 2-opt local search on combined score
       5. Re-insert anchors
 
@@ -654,8 +363,7 @@ def rechunk_with_pose_weights(chunks, anchors, sim_matrix, W_pose,
     stripped = [[f for f in ch if f not in anchor_set] for ch in chunks]
 
     U_appearance = _compute_score_matrix(sim, score_type, alpha)
-    U_combined = _combine_score_matrices(U_appearance, W_pose, combine_mode, alpha_combine,
-                                          epsilon=epsilon)
+    U_combined = _combine_score_matrices(U_appearance, W_pose, epsilon=epsilon)
 
     t_ls_start = _time.time()
     _utility_2opt_local_search(stripped, U_combined, local_search_iters)

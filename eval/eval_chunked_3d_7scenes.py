@@ -1,10 +1,10 @@
 """
-7-Scenes 3D Reconstruction Evaluation — In-model FL Chunked Inference (VGGT)
+7-Scenes 3D Reconstruction Evaluation — Chunked Inference (VGGT)
 
 Passes ALL n_frames to a single model(images) call. When n_frames > chunk_size,
 VGGT internally:
   1. DINOv2 batch on all images (mini-batched)
-  2. FL maxmin split into K chunks (frame 0 shared across all chunks)
+  2. Diversity-aware split into K chunks (random + reverse-similarity 2-opt LS)
   3. K sequential transformer + camera_head + depth_head passes
   4. Depth scale alignment across chunks via shared anchor
   5. SE3 alignment across chunks
@@ -27,14 +27,9 @@ GT depth: .depth.proj.png (NOT .depth.png)
 
 Usage:
     python eval_chunked_3d_7scenes.py \\
-        --dataset_dir /workspace/dataset/7scenes \\
-        --n_frames 200 --chunk_size 50
-
-    # With specific method and scenes:
-    python eval_chunked_3d_7scenes.py \\
-        --dataset_dir /workspace/dataset/7scenes \\
-        --n_frames 200 --chunk_size 50 \\
-        --sampling_method fl_maxmin_ls_revsim \\
+        --dataset_dir /path/to/7scenes \\
+        --n_frames 500 --chunk_size 50 \\
+        --sampling_method da_partitioning --rechunk_remaining_only \\
         --scenes chess fire
 """
 
@@ -320,7 +315,7 @@ def run_inference(model, image_paths, device, dtype):
 # =============================================================================
 
 def _poseweight_allchunk_inference_3d(model, images, rechunked, anchors, device, dtype,
-                                      patch_tokens_cpu=None, align_mode="sim3"):
+                                      patch_tokens_cpu=None, align_mode="se3"):
     """Run inference on each rechunked chunk using pre-computed patch tokens, return aligned extrinsics + depth."""
     H, W = images.shape[-2:]
     K = len(rechunked)
@@ -425,7 +420,7 @@ def _poseweight_allchunk_inference_3d(model, images, rechunked, anchors, device,
 def _poseweight_remaining_inference_3d(model, images, rechunked, anchors,
                                         chunk0_se3, chunk0_intrinsic, chunk0_depth, chunk0_depth_conf,
                                         chunk0_indices, device, dtype,
-                                        patch_tokens_cpu=None, align_mode="sim3"):
+                                        patch_tokens_cpu=None, align_mode="se3"):
     """Reuse chunk0 results, infer only K-1 remaining chunks for 3D evaluation."""
     H, W = images.shape[-2:]
     K = len(rechunked)
@@ -522,13 +517,12 @@ def _poseweight_remaining_inference_3d(model, images, rechunked, anchors,
 
 
 def run_inference_poseweight_3d(model, image_paths, device, dtype,
-                                 combine_mode="A", alpha_combine=0.5,
                                  gamma=1.0, tau=None,
                                  score_type="revsim", ls_iters=5,
                                  n_anchors=1, chunk_size=50,
                                  rechunk_remaining_only=False,
                                  epsilon=None,
-                                 align_mode="sim3", anchor_select="uniform",
+                                 align_mode="se3", anchor_select="uniform",
                                  seed=42):
     """Two-phase pose-weighted chunked inference for 3D evaluation.
 
@@ -637,7 +631,6 @@ def run_inference_poseweight_3d(model, image_paths, device, dtype,
         rechunked_rest, anchors_new, t_ls_rechunk = rechunk_with_pose_weights(
             remaining_chunks, remaining_anchors, sim_matrix, W_pose,
             score_type=score_type, alpha=0.0,
-            combine_mode=combine_mode, alpha_combine=alpha_combine,
             n_anchors=n_anchors, local_search_iters=ls_iters,
             epsilon=epsilon,
             anchors_override=precomputed_anchors,
@@ -648,7 +641,6 @@ def run_inference_poseweight_3d(model, image_paths, device, dtype,
         rechunked, anchors_new, t_ls_rechunk = rechunk_with_pose_weights(
             chunks, anchors_init, sim_matrix, W_pose,
             score_type=score_type, alpha=0.0,
-            combine_mode=combine_mode, alpha_combine=alpha_combine,
             n_anchors=n_anchors, local_search_iters=ls_iters,
             epsilon=epsilon,
             anchors_override=precomputed_anchors,
@@ -701,7 +693,6 @@ def run_inference_poseweight_3d(model, image_paths, device, dtype,
 # =============================================================================
 
 def process_sequence(model, frame_triplets, device, dtype, conf_thresh, rng,
-                     poseweight_mode=None, combine_mode="A", alpha_combine=0.5,
                      gamma=1.0, tau=None, epsilon=None,
                      rechunk_remaining_only=False,
                      export_ply=False, ply_prefix=None, seed=42):
@@ -722,49 +713,26 @@ def process_sequence(model, frame_triplets, device, dtype, conf_thresh, rng,
     depth_paths = [t[1] for t in frame_triplets]
     pose_paths  = [t[2] for t in frame_triplets]
 
-    if poseweight_mode in ("pseudo", "gt"):
+    if model.aggregator.sampling_method == "da_partitioning":
         chunk_size = model.aggregator.sampling_max_frames
         if chunk_size <= 0:
             chunk_size = 50
         n_anchors = getattr(model.aggregator, 'sampling_n_anchors', 1)
         ls_iters = model.aggregator.sampling_local_search_iters
-        align_mode = getattr(model.aggregator, 'sampling_align_mode', 'sim3')
+        align_mode = getattr(model.aggregator, 'sampling_align_mode', 'se3')
         anchor_select = getattr(model.aggregator, 'sampling_anchor_select', 'uniform')
 
-        if poseweight_mode == "pseudo":
-            (all_extrinsic, all_intrinsic, depth_pred, depth_conf,
-             img_shape, num_chunks, timing, initial_chunks, rechunked_chunks,
-             sim_matrix, tau_used) = run_inference_poseweight_3d(
-                model, color_paths, device, dtype,
-                combine_mode=combine_mode, alpha_combine=alpha_combine,
-                gamma=gamma, tau=tau,
-                score_type="revsim", ls_iters=ls_iters,
-                n_anchors=n_anchors, chunk_size=chunk_size,
-                rechunk_remaining_only=rechunk_remaining_only,
-                epsilon=epsilon,
-                align_mode=align_mode, anchor_select=anchor_select,
-                seed=seed)
-        else:  # gt
-            # Load GT c2w poses to get positions
-            gt_c2ws = []
-            for pp in pose_paths:
-                c2w = load_7scenes_pose(pp)
-                if c2w is None:
-                    c2w = np.eye(4, dtype=np.float64)
-                gt_c2ws.append(c2w)
-            gt_positions = np.stack([c[:3, 3] for c in gt_c2ws], axis=0)
-            (all_extrinsic, all_intrinsic, depth_pred, depth_conf,
-             img_shape, num_chunks, timing, initial_chunks, rechunked_chunks,
-             sim_matrix, tau_used) = run_inference_poseweight_3d(
-                model, color_paths, device, dtype,
-                combine_mode=combine_mode, alpha_combine=alpha_combine,
-                gamma=gamma, tau=tau,
-                score_type="revsim", ls_iters=ls_iters,
-                n_anchors=n_anchors, chunk_size=chunk_size,
-                rechunk_remaining_only=rechunk_remaining_only,
-                epsilon=epsilon,
-                align_mode=align_mode, anchor_select=anchor_select,
-                seed=seed)
+        (all_extrinsic, all_intrinsic, depth_pred, depth_conf,
+         img_shape, num_chunks, timing, initial_chunks, rechunked_chunks,
+         sim_matrix, tau_used) = run_inference_poseweight_3d(
+            model, color_paths, device, dtype,
+            gamma=gamma, tau=tau,
+            score_type="revsim", ls_iters=ls_iters,
+            n_anchors=n_anchors, chunk_size=chunk_size,
+            rechunk_remaining_only=rechunk_remaining_only,
+            epsilon=epsilon,
+            align_mode=align_mode, anchor_select=anchor_select,
+            seed=seed)
 
         extrinsic = all_extrinsic.unsqueeze(0).float()
         intrinsic = all_intrinsic.unsqueeze(0).float()
@@ -1000,12 +968,13 @@ def main():
                         help="Number of frames to uniformly sample per sequence")
     parser.add_argument("--chunk_size", type=int, default=50,
                         help="Max frames per chunk (sampling_max_frames)")
-    parser.add_argument("--sampling_method", type=str, default="random_ls_revsim",
-                        choices=["random", "origin", "random_ls_revsim"],
-                        help="Chunk sampling method. "
-                             "'random' = random balanced partitioning (no local search) baseline; "
-                             "'origin' = single-batch, no chunking; "
-                             "'random_ls_revsim' = diversity-aware local-search reverse-similarity split.")
+    parser.add_argument("--sampling_method", type=str, default="da_partitioning",
+                        choices=["da_partitioning", "random_partitioning", "origin"],
+                        help="View partitioning method: "
+                             "'da_partitioning' = diversity-aware partitioning (ours) — random "
+                             "split refined by 2-opt local search and pose-weighted re-chunking; "
+                             "'random_partitioning' = random partitioning without local search (baseline); "
+                             "'origin' = no partitioning, single full-sequence pass (baseline).")
     parser.add_argument("--local_search_iters", type=int, default=5,
                         help="2-opt local search iterations for LS methods")
     parser.add_argument("--conf_thresh", type=float, default=0.0,
@@ -1020,13 +989,7 @@ def main():
                         help="DINOv2 mini-batch size")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="./results_chunked_3d_7scenes")
-    # Pose-weight re-chunking args
-    parser.add_argument("--poseweight_mode", type=str, default=None,
-                        choices=["pseudo", "gt"],
-                        help="Pose-weighted re-chunking: pseudo (1st chunk inference) or gt (GT poses)")
-    parser.add_argument("--combine_mode", type=str, default="E",
-                        choices=["E"],
-                        help="Score combination mode (E = epsilon-subtractive)")
+    # Pose-weighted re-chunking args (used by sampling_method=da_partitioning)
     parser.add_argument("--gamma", type=float, default=0.001,
                         help="Softmax temperature for pseudo-pose soft assignment")
     parser.add_argument("--tau", type=float, default=None,
@@ -1062,9 +1025,9 @@ def main():
 
     model = load_model(device, args.model_path, args.chunk_size)
     model.aggregator.dino_batch_size = args.dino_batch_size
-    # 'random' is exposed as the random-balanced (no local search) baseline
+    # 'random_partitioning' maps to the aggregator's random-balanced split (no local search)
     model.aggregator.sampling_method = (
-        "random_balanced" if args.sampling_method == "random" else args.sampling_method)
+        "random_balanced" if args.sampling_method == "random_partitioning" else args.sampling_method)
     model.aggregator.sampling_local_search_iters = args.local_search_iters
 
     # Origin mode: disable chunking
@@ -1075,8 +1038,8 @@ def main():
     print(f"# VGGT Chunked 3D Eval (7-Scenes, method={args.sampling_method})")
     print(f"# n_frames={args.n_frames}, chunk_size={args.chunk_size}")
     print(f"# dtype={args.dtype}, conf_thresh={args.conf_thresh}")
-    if args.poseweight_mode:
-        print(f"# poseweight_mode={args.poseweight_mode}, combine_mode={args.combine_mode}, "
+    if args.sampling_method == "da_partitioning":
+        print(f"# pose-weighted re-chunking: "
               f"gamma={args.gamma}, tau={args.tau}, "
               f"epsilon={args.epsilon}, rechunk_remaining_only={args.rechunk_remaining_only}")
     print(f"{'#'*60}\n")
@@ -1112,9 +1075,6 @@ def main():
             try:
                 result = process_sequence(model, sampled, device, dtype,
                                           args.conf_thresh, rng,
-                                          poseweight_mode=args.poseweight_mode,
-                                          combine_mode=args.combine_mode,
-                                          alpha_combine=0.5,
                                           gamma=args.gamma,
                                           tau=args.tau,
                                           epsilon=args.epsilon,
@@ -1155,11 +1115,11 @@ def main():
     print(f'{"="*60}')
 
     # Save results
-    pair_suffix = f"_ls{args.local_search_iters}" if args.sampling_method == "random_ls_revsim" else ""
+    pair_suffix = f"_ls{args.local_search_iters}" if args.sampling_method == "da_partitioning" else ""
     anchor_suffix = "first_anchor"
     pw_suffix = ""
-    if args.poseweight_mode:
-        pw_suffix = f"_pw{args.poseweight_mode}_mode{args.combine_mode}_g{args.gamma}"
+    if args.sampling_method == "da_partitioning":
+        pw_suffix = f"_pw_g{args.gamma}"
         if args.epsilon is not None:
             pw_suffix += f"_eps{args.epsilon}"
         if args.rechunk_remaining_only:

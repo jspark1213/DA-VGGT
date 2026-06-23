@@ -1,5 +1,5 @@
 """
-Bonn RGBD Depth Estimation — In-model FL Chunked Inference (VGGT)
+Bonn RGBD Depth Estimation — Chunked Inference (VGGT)
 
 Evaluates depth prediction quality on the Bonn RGBD dataset using chunked
 inference. For each scene, uniformly samples n_frames, runs VGGT with
@@ -18,8 +18,10 @@ Dataset format (TUM-style):
 
 Usage:
     python eval_chunked_depth_bonn.py \
-        --dataset_dir /workspace/dataset/bonn \
-        --n_frames 200 --chunk_size 50 --scenes rgbd_bonn_balloon
+        --dataset_dir /path/to/bonn \
+        --n_frames 500 --chunk_size 50 \
+        --sampling_method da_partitioning --rechunk_remaining_only \
+        --scenes rgbd_bonn_balloon
 """
 
 import os, sys, json, time, random, logging, warnings
@@ -473,7 +475,6 @@ def _poseweight_remaining_inference_depth(model, images, rechunked, anchors,
 
 
 def run_inference_poseweight_depth(model, image_paths, device, dtype,
-                                    combine_mode="A", alpha_combine=0.5,
                                     gamma=1.0, tau=None,
                                     score_type="revsim", ls_iters=5,
                                     n_anchors=1, chunk_size=50,
@@ -604,7 +605,6 @@ def run_inference_poseweight_depth(model, image_paths, device, dtype,
         rechunked_rest, anchors_new, t_ls_rechunk = rechunk_with_pose_weights(
             remaining_chunks, remaining_anchors, sim_matrix, W_pose,
             score_type=score_type, alpha=0.0,
-            combine_mode=combine_mode, alpha_combine=alpha_combine,
             n_anchors=n_anchors, local_search_iters=ls_iters,
             epsilon=epsilon,
             anchors_override=precomputed_anchors,
@@ -617,7 +617,6 @@ def run_inference_poseweight_depth(model, image_paths, device, dtype,
         rechunked, anchors_new, t_ls_rechunk = rechunk_with_pose_weights(
             chunks, anchors_init, sim_matrix, W_pose,
             score_type=score_type, alpha=0.0,
-            combine_mode=combine_mode, alpha_combine=alpha_combine,
             n_anchors=n_anchors, local_search_iters=ls_iters,
             epsilon=epsilon,
             anchors_override=precomputed_anchors,
@@ -712,7 +711,6 @@ def run_inference(model, image_paths, device, dtype):
 
 def evaluate_scene(scene_name, scene_path, model, device, dtype, n_frames,
                    min_depth, max_depth,
-                   poseweight_mode=None, combine_mode="E",
                    gamma=0.001, tau=None, epsilon=None,
                    rechunk_remaining_only=False):
     all_frames = load_bonn_frames(scene_path)
@@ -728,7 +726,7 @@ def evaluate_scene(scene_name, scene_path, model, device, dtype, n_frames,
     N = len(sampled)
 
     # Inference
-    if poseweight_mode == "pseudo":
+    if model.aggregator.sampling_method == "da_partitioning":
         chunk_size = model.aggregator.sampling_max_frames
         if chunk_size <= 0:
             chunk_size = 50
@@ -739,7 +737,6 @@ def evaluate_scene(scene_name, scene_path, model, device, dtype, n_frames,
          timing, initial_chunks, rechunked_chunks, sim_matrix, tau_used,
          depth_chunk_scales) = run_inference_poseweight_depth(
             model, image_paths, device, dtype,
-            combine_mode=combine_mode, alpha_combine=0.5,
             gamma=gamma, tau=tau,
             score_type="revsim", ls_iters=ls_iters,
             n_anchors=1, chunk_size=chunk_size,
@@ -897,14 +894,15 @@ def main():
                         help="Number of frames to uniformly sample per scene")
     parser.add_argument("--chunk_size", type=int, default=50,
                         help="Max frames per chunk (sampling_max_frames)")
-    parser.add_argument("--sampling_method", type=str, default="random_ls_revsim",
-                        choices=["random", "origin", "random_ls_revsim"],
-                        help="Chunk sampling method. "
-                             "'random' = random balanced partitioning (no local search) baseline; "
-                             "'origin' = single-batch, no chunking; "
-                             "'random_ls_revsim' = diversity-aware local-search reverse-similarity split.")
+    parser.add_argument("--sampling_method", type=str, default="da_partitioning",
+                        choices=["da_partitioning", "random_partitioning", "origin"],
+                        help="View partitioning method: "
+                             "'da_partitioning' = diversity-aware partitioning (ours) — random "
+                             "split refined by 2-opt local search and pose-weighted re-chunking; "
+                             "'random_partitioning' = random partitioning without local search (baseline); "
+                             "'origin' = no partitioning, single full-sequence pass (baseline).")
     parser.add_argument("--local_search_iters", type=int, default=5,
-                        help="2-opt local search iterations for random_ls_revsim (0=skip)")
+                        help="2-opt local search iterations for da_partitioning (0=skip)")
     parser.add_argument("--scenes", nargs="+", default=None,
                         help="Specific scenes to evaluate (default: all)")
     parser.add_argument("--min_depth", type=float, default=0.1,
@@ -919,13 +917,7 @@ def main():
                         help="DINOv2 mini-batch size")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="./results_chunked_depth_bonn")
-    # Poseweight arguments
-    parser.add_argument("--poseweight_mode", type=str, default=None,
-                        choices=["pseudo", "gt"],
-                        help="Pose-weighted re-chunking: pseudo (1st chunk inference) or gt (GT poses)")
-    parser.add_argument("--combine_mode", type=str, default="E",
-                        choices=["E"],
-                        help="Poseweight combine mode")
+    # Pose-weighted re-chunking arguments (used by sampling_method=da_partitioning)
     parser.add_argument("--gamma", type=float, default=0.001,
                         help="Pseudo-pose interpolation gamma")
     parser.add_argument("--tau", type=float, default=None,
@@ -949,9 +941,9 @@ def main():
 
     model = load_model(device, args.model_path, args.chunk_size)
     model.aggregator.dino_batch_size = args.dino_batch_size
-    # 'random' is exposed as the random-balanced (no local search) baseline
+    # 'random_partitioning' maps to the aggregator's random-balanced split (no local search)
     model.aggregator.sampling_method = (
-        "random_balanced" if args.sampling_method == "random" else args.sampling_method)
+        "random_balanced" if args.sampling_method == "random_partitioning" else args.sampling_method)
     model.aggregator.sampling_seed = args.seed
     model.aggregator.sampling_local_search_iters = args.local_search_iters
 
@@ -988,8 +980,6 @@ def main():
         result = evaluate_scene(
             scene_name, scene_path, model, device, dtype,
             args.n_frames, args.min_depth, args.max_depth,
-            poseweight_mode=args.poseweight_mode,
-            combine_mode=args.combine_mode,
             gamma=args.gamma, tau=args.tau, epsilon=args.epsilon,
             rechunk_remaining_only=args.rechunk_remaining_only,
         )
@@ -1236,11 +1226,11 @@ def main():
         'global_summary': global_summary,
     }
 
-    pair_suffix = f"_ls{args.local_search_iters}" if args.sampling_method == "random_ls_revsim" else ""
+    pair_suffix = f"_ls{args.local_search_iters}" if args.sampling_method == "da_partitioning" else ""
     anchor_suffix = "first_anchor"
     pw_suffix = ""
-    if args.poseweight_mode is not None:
-        pw_suffix = f"_pw{args.poseweight_mode}_cm{args.combine_mode}"
+    if args.sampling_method == "da_partitioning":
+        pw_suffix = f"_pw"
         if args.tau is not None:
             pw_suffix += f"_tau{args.tau}"
         if args.epsilon is not None:

@@ -1,27 +1,21 @@
 """
-7-Scenes Pose Estimation — In-model FL Chunked Inference (VGGT)
+7-Scenes Pose Estimation — Chunked Inference (VGGT)
 
-Passes ALL n_frames to a single model(images) call. When n_frames > chunk_size,
-VGGT internally:
+Pipeline for sampling_method=da_partitioning:
   1. DINOv2 batch on all images (mini-batched)
-  2. FL maxmin split into K chunks
-  3. K sequential transformer + camera_head passes
-  4. SE3 alignment across chunks
-  → Returns pose_enc [1, S, 9] for all frames
+  2. Diversity-aware split into K chunks (random + reverse-similarity 2-opt LS)
+  3. Pose-weighted re-chunking from chunk-0 pseudo-poses
+  4. K sequential transformer + camera_head passes
+  5. Single-anchor SE3 alignment across chunks
 
 Usage:
     python eval_chunked_pose_7scenes.py \
-        --dataset_dir /workspace/dataset/7scenes \
-        --n_frames 200 \
+        --dataset_dir /path/to/7scenes \
+        --n_frames 500 \
         --chunk_size 50 \
+        --sampling_method da_partitioning \
+        --rechunk_remaining_only \
         --scenes chess fire
-
-    # With diversity regularization:
-    python eval_chunked_pose_7scenes.py \
-        --dataset_dir /workspace/dataset/7scenes \
-        --n_frames 200 \
-        --chunk_size 50 \
-        --lambda_div 0.1
 """
 
 import os, sys, json, time, random, logging, warnings
@@ -45,7 +39,6 @@ import torch.nn.functional as F
 from vggt.models.aggregator import (
     random_balanced_ls_revsim_split,
     compute_pseudo_poses, compute_pose_weight_matrix, rechunk_with_pose_weights,
-    compute_pseudo_rotations, compute_se3_pose_weight_matrix,
 )
 
 logging.getLogger("dinov2").setLevel(logging.WARNING)
@@ -564,11 +557,6 @@ def visualize_scene_trajectories(seq_data, scene, vis_dir,
 # Data loading
 # =============================================================================
 
-def parse_test_split(dataset_dir, scene):
-    """Backward-compat shim: read TestSplit.txt."""
-    return parse_split(dataset_dir, scene, split='test')
-
-
 def parse_split(dataset_dir, scene, split='test'):
     """Parse a 7Scenes split file.
 
@@ -752,105 +740,23 @@ def select_anchors(N, n_anchors, mode="uniform", sim_matrix=None, seed=42):
     raise ValueError(f"Unknown anchor_select mode: {mode!r} (expected 'uniform', 'fps_sim', 'random', or 'first')")
 
 
-# =============================================================================
-# Multi-anchor SE3 / Sim3 alignment helpers
-# =============================================================================
+def _compute_chunk_alignment(src_anchor_se3_list, dst_anchor_se3_list):
+    """Single-anchor rigid SE3 alignment from a chunk's anchor to the reference anchor.
 
-def _rotation_procrustes(src_rot_cols, dst_rot_cols):
-    """Best-fit rotation R such that R @ src ≈ dst (no centering, scale-invariant).
-
-    Args:
-        src_rot_cols: (M, 3) source direction vectors.
-        dst_rot_cols: (M, 3) destination direction vectors.
-    Returns:
-        R: (3, 3) rotation matrix.
-    """
-    Mmat = dst_rot_cols.T @ src_rot_cols  # [3, 3]
-    U, _, Vt = torch.linalg.svd(Mmat)
-    sign = torch.eye(3, device=src_rot_cols.device, dtype=src_rot_cols.dtype)
-    if torch.det(U @ Vt) < 0:
-        sign[2, 2] = -1.0
-    return U @ sign @ Vt
-
-
-def _multi_anchor_align(src_anchor_se3_list, dst_anchor_se3_list, mode):
-    """Decoupled multi-anchor alignment of SE3 correspondences.
-
-    Models the chunk-k → reference transform as:
-        c_dst = s * R * c_src + t          (positions: scale-bearing)
-        R_dst = R * R_src                  (rotations: scale-invariant)
-
-    R is fit from rotation-matrix columns via orthogonal Procrustes (using rotation
-    info from every anchor). With R fixed, s (sim3 only) and t are fit by LS on the
-    anchor camera centers. For mode="se3" the scale is forced to 1.
-
-    Args:
-        src_anchor_se3_list: list of (4, 4) tensors (chunk k's anchor c2w SE3).
-        dst_anchor_se3_list: list of (4, 4) tensors (reference c2w SE3).
-        mode: "se3" or "sim3".
-    Returns:
-        R: (3, 3), t: (3,), s: 0-d tensor (==1 for se3 / degenerate cases).
-    """
-    M = len(src_anchor_se3_list)
-    src = torch.stack(src_anchor_se3_list).float()  # [M, 4, 4]
-    dst = torch.stack(dst_anchor_se3_list).float()
-
-    # Stack each anchor's 3 rotation-matrix columns as direction-vector correspondences.
-    src_cols = src[:, :3, :3].permute(0, 2, 1).reshape(-1, 3)  # [3M, 3]
-    dst_cols = dst[:, :3, :3].permute(0, 2, 1).reshape(-1, 3)
-    R = _rotation_procrustes(src_cols, dst_cols)
-
-    src_pos = src[:, :3, 3]  # [M, 3]
-    dst_pos = dst[:, :3, 3]
-    mu_src = src_pos.mean(dim=0)
-    mu_dst = dst_pos.mean(dim=0)
-    src_c = src_pos - mu_src
-    dst_c = dst_pos - mu_dst
-
-    if mode == "sim3":
-        var_src = (src_c ** 2).sum()
-        if var_src < 1e-12:
-            s = src_pos.new_ones(())
-        else:
-            rotated_src_c = src_c @ R.T  # [M, 3]
-            s = (dst_c * rotated_src_c).sum() / var_src
-    elif mode == "se3":
-        s = src_pos.new_ones(())
-    else:
-        raise ValueError(f"Unknown align_mode: {mode}")
-
-    t = mu_dst - s * (R @ mu_src)
-    return R, t, s
-
-
-def _compute_chunk_alignment(src_anchor_se3_list, dst_anchor_se3_list, mode):
-    """Compute alignment from chunk k anchors to reference anchors.
-
-    For len==1 we use the closed-form single-anchor SE3 transform (exact, no scale).
-    For len>=2 we run multi-anchor LS via _multi_anchor_align ("se3" or "sim3").
+    With one anchor the transform is the exact closed-form T = dst @ inv(src)
+    (rigid SE3, no scale).
 
     Returns:
         T_rigid: (4, 4) rigid transform tensor.
-        scale: 0-d tensor (==1 for se3 / single-anchor).
+        scale: 0-d tensor (== 1; SE3 has no scale).
 
     See _apply_chunk_alignment for how to apply (T_rigid, scale) to a pose batch.
     """
-    assert len(src_anchor_se3_list) == len(dst_anchor_se3_list) and len(src_anchor_se3_list) >= 1
     device = src_anchor_se3_list[0].device
     dtype = src_anchor_se3_list[0].dtype
-
-    if len(src_anchor_se3_list) == 1:
-        T_align = dst_anchor_se3_list[0] @ torch.linalg.inv(src_anchor_se3_list[0])
-        scale = torch.ones((), device=device, dtype=dtype)
-        return T_align, scale
-
-    with torch.amp.autocast('cuda', enabled=False):
-        R, t, s = _multi_anchor_align(src_anchor_se3_list, dst_anchor_se3_list, mode)
-
-    T_rigid = torch.eye(4, device=device, dtype=dtype)
-    T_rigid[:3, :3] = R.to(dtype)
-    T_rigid[:3, 3] = t.to(dtype)
-    return T_rigid, s.to(dtype)
+    T_align = dst_anchor_se3_list[0] @ torch.linalg.inv(src_anchor_se3_list[0])
+    scale = torch.ones((), device=device, dtype=dtype)
+    return T_align, scale
 
 
 def _apply_chunk_alignment(T_rigid, scale, se3_batch):
@@ -886,7 +792,7 @@ def _apply_chunk_alignment(T_rigid, scale, se3_batch):
 
 def _poseweight_remaining_inference(model, images, rechunked, anchors,
                                      chunk0_se3, chunk0_indices, device, dtype,
-                                     patch_tokens_cpu=None, align_mode="sim3"):
+                                     patch_tokens_cpu=None):
     """Reuse chunk0 SE3, infer only remaining K-1 chunks, then SE3-align.
 
     Args:
@@ -942,7 +848,7 @@ def _poseweight_remaining_inference(model, images, rechunked, anchors,
     torch.cuda.synchronize()
     t_infer = time.time() - t0
 
-    # Multi-anchor SE3/Sim3 alignment via shared anchors
+    # Single-anchor SE3 alignment via the shared anchor
     t0 = time.time()
     anchor_set = set(anchors)
 
@@ -960,7 +866,7 @@ def _poseweight_remaining_inference(model, images, rechunked, anchors,
         src_positions = [rechunked[k].index(a) for a in anchors]
         src_anchor_se3_list = [chunk_se3s[k][p] for p in src_positions]
         T_rigid, scale = _compute_chunk_alignment(
-            src_anchor_se3_list, ref_anchor_se3_list, align_mode)
+            src_anchor_se3_list, ref_anchor_se3_list)
         for pos, idx in enumerate(rechunked[k]):
             if idx not in anchor_set:
                 aligned_se3[idx] = _apply_chunk_alignment(
@@ -974,7 +880,7 @@ def _poseweight_remaining_inference(model, images, rechunked, anchors,
 
 
 def _poseweight_allchunk_inference(model, images, rechunked, anchors, device, dtype,
-                                    patch_tokens_cpu=None, align_mode="sim3"):
+                                    patch_tokens_cpu=None):
     """Run inference on each chunk using pre-computed patch tokens and SE3-align via shared anchor.
 
     Args:
@@ -1028,7 +934,7 @@ def _poseweight_allchunk_inference(model, images, rechunked, anchors, device, dt
     torch.cuda.synchronize()
     t_infer = time.time() - t0
 
-    # Multi-anchor SE3/Sim3 alignment via shared anchors
+    # Single-anchor SE3 alignment via the shared anchor
     t0 = time.time()
     anchor_set = set(anchors)
     ref_anchor_positions = [rechunked[0].index(a) for a in anchors]
@@ -1043,7 +949,7 @@ def _poseweight_allchunk_inference(model, images, rechunked, anchors, device, dt
             src_positions = [rechunked[k].index(a) for a in anchors]
             src_anchor_se3_list = [chunk_se3s[k][p] for p in src_positions]
             T_rigid, scale = _compute_chunk_alignment(
-                src_anchor_se3_list, ref_anchor_se3_list, align_mode)
+                src_anchor_se3_list, ref_anchor_se3_list)
             for pos, idx in enumerate(rechunked[k]):
                 if idx not in anchor_set:
                     aligned_se3[idx] = _apply_chunk_alignment(
@@ -1056,32 +962,14 @@ def _poseweight_allchunk_inference(model, images, rechunked, anchors, device, dt
     return pred_se3, t_infer, t_align
 
 
-def _compute_pose_weight_matrix_scaled(positions, tau=None, tau_mult=1.0):
-    """Wrap compute_pose_weight_matrix so τ can be scaled multiplicatively
-    relative to the auto-computed median pairwise distance.
-
-    Used for τ-sensitivity sweep — passing tau_mult ∈ {0.25, 0.5, 1, 2, 4} with
-    tau=None scales the per-sequence median by that factor without requiring
-    knowledge of the median ahead of time.
-    """
-    if tau is not None or tau_mult == 1.0:
-        return compute_pose_weight_matrix(positions, tau=tau)
-    _, tau_med = compute_pose_weight_matrix(positions, tau=None)
-    return compute_pose_weight_matrix(positions, tau=tau_med * tau_mult)
-
-
 def run_inference_poseweight(model, image_paths, device, dtype,
-                              combine_mode="A", alpha_combine=0.5,
-                              gamma=1.0, tau=None, tau_mult=1.0,
+                              gamma=1.0, tau=None,
                               score_type="revsim", ls_iters=5,
                               n_anchors=1, chunk_size=50,
                               rechunk_remaining_only=False,
                               epsilon=None,
-                              initial_ls_iters=None,
-                              align_mode="sim3",
                               anchor_select="uniform",
-                              seed=42,
-                              rotation_cue="none", alpha_rot=None):
+                              seed=42):
     """Two-phase pose-weighted chunked inference (pseudo-pose version).
 
     Pipeline:
@@ -1128,11 +1016,10 @@ def run_inference_poseweight(model, image_paths, device, dtype,
     timing['anchor_select'] = anchor_select
 
     # ---- Phase 1d: Initial chunking (random + revsim LS) ----
-    _init_ls = initial_ls_iters if initial_ls_iters is not None else ls_iters
     t0 = time.time()
     chunks, anchors_init, t_ls_initial = random_balanced_ls_revsim_split(
         sim_matrix, chunk_size, n_anchors=n_anchors,
-        local_search_iters=_init_ls, seed=seed,
+        local_search_iters=ls_iters, seed=seed,
         anchors_override=precomputed_anchors,
     )
     timing['initial_chunking'] = time.time() - t0
@@ -1184,40 +1071,11 @@ def run_inference_poseweight(model, image_paths, device, dtype,
     pseudo_positions = compute_pseudo_poses(
         chunk0_positions, chunk0_indices, S, sim_matrix, gamma=gamma,
     )
-    # Rotation propagation (rebuttal ablation). chunk0 rotations are c2w
-    # (R_w2c.T) so geodesic distance is well-defined.
-    pseudo_rotations = None
-    if rotation_cue in ("additive", "rotation"):
-        chunk0_R_c2w = np.transpose(R_w2c, (0, 2, 1))  # (S_k, 3, 3) c2w
-        pseudo_rotations = compute_pseudo_rotations(
-            chunk0_R_c2w, chunk0_indices, S, sim_matrix, gamma=gamma,
-        )
     timing['pseudo_pose_computation'] = time.time() - t0
-    timing['rotation_cue'] = rotation_cue
-    timing['alpha_rot'] = alpha_rot
 
     # ---- Phase 3a: Pose weight matrix ----
     t0 = time.time()
-    if rotation_cue == "none":
-        W_pose, tau_used = _compute_pose_weight_matrix_scaled(
-            pseudo_positions, tau=tau, tau_mult=tau_mult)
-    else:
-        # SE(3) dispersion (fair-normalized): translation/rotation each divided
-        # by their own median pairwise value before summation.
-        if tau is None and tau_mult != 1.0:
-            _, tau_med = compute_se3_pose_weight_matrix(
-                pseudo_positions, rotations=pseudo_rotations,
-                tau=None, alpha_rot=alpha_rot,
-                mode=rotation_cue,
-            )
-            tau_eff = tau_med * tau_mult
-        else:
-            tau_eff = tau
-        W_pose, tau_used = compute_se3_pose_weight_matrix(
-            pseudo_positions, rotations=pseudo_rotations,
-            tau=tau_eff, alpha_rot=alpha_rot,
-            mode=rotation_cue,
-        )
+    W_pose, tau_used = compute_pose_weight_matrix(pseudo_positions, tau=tau)
     timing['pose_weight_computation'] = time.time() - t0
 
     # ---- Phase 3b: Re-chunking ----
@@ -1231,7 +1089,6 @@ def run_inference_poseweight(model, image_paths, device, dtype,
         rechunked_rest, anchors_new, t_ls_rechunk = rechunk_with_pose_weights(
             remaining_chunks, remaining_anchors, sim_matrix, W_pose,
             score_type=score_type, alpha=0.0,
-            combine_mode=combine_mode, alpha_combine=alpha_combine,
             n_anchors=n_anchors, local_search_iters=ls_iters,
             epsilon=epsilon,
             anchors_override=precomputed_anchors,
@@ -1244,7 +1101,6 @@ def run_inference_poseweight(model, image_paths, device, dtype,
         rechunked, anchors_new, t_ls_rechunk = rechunk_with_pose_weights(
             chunks, anchors_init, sim_matrix, W_pose,
             score_type=score_type, alpha=0.0,
-            combine_mode=combine_mode, alpha_combine=alpha_combine,
             n_anchors=n_anchors, local_search_iters=ls_iters,
             epsilon=epsilon,
             anchors_override=precomputed_anchors,
@@ -1260,123 +1116,12 @@ def run_inference_poseweight(model, image_paths, device, dtype,
             model, images, rechunked, anchors_new, chunk0_se3,
             chunk0_indices, device, dtype,
             patch_tokens_cpu=patch_tokens_cpu,
-            align_mode=align_mode,
         )
     else:
         pred_se3, t_infer, t_align = _poseweight_allchunk_inference(
             model, images, rechunked, anchors_new, device, dtype,
             patch_tokens_cpu=patch_tokens_cpu,
-            align_mode=align_mode,
         )
-    timing['all_chunks_inference'] = t_infer
-    timing['alignment'] = t_align
-
-    timing['total'] = (timing['dino'] + timing['sim_matrix']
-                       + timing['initial_chunking']
-                       + timing['first_chunk_inference']
-                       + timing['pseudo_pose_computation']
-                       + timing['pose_weight_computation']
-                       + timing['rechunking_total']
-                       + timing['all_chunks_inference']
-                       + timing['alignment'])
-    timing['peak_vram_total_mb'] = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-
-    del images, patch_tokens_cpu
-    torch.cuda.empty_cache()
-
-    K = len(rechunked)
-    return (pred_se3, img_shape, K, timing,
-            initial_chunks, rechunked_chunks, sim_matrix, tau_used)
-
-
-def run_inference_gtposeweight(model, image_paths, device, dtype,
-                                gt_positions,
-                                combine_mode="A", alpha_combine=0.5,
-                                tau=None, tau_mult=1.0,
-                                score_type="revsim", ls_iters=5,
-                                n_anchors=1, chunk_size=50,
-                                align_mode="sim3",
-                                anchor_select="uniform",
-                                seed=42):
-    """GT-pose-weighted chunked inference (skip first chunk inference).
-
-    Pipeline:
-      Phase 1: DINO all -> sim matrix -> initial chunking (step_ls_revsim)
-      Phase 2: Compute W_pose from GT positions -> combine -> re-chunk via 2-opt LS
-      Phase 3: All-chunk inference -> SE3 alignment
-
-    Returns:
-        (pred_se3, img_shape, K, timing, initial_chunks, rechunked_chunks,
-         sim_matrix, tau_used)
-    """
-    timing = {}
-    images = load_and_preprocess_images(image_paths).to(device)
-    if images.dim() == 4:
-        images = images.unsqueeze(0)
-    S = images.shape[1]
-    img_shape = images.shape[-2:]
-
-    # ---- Phase 1a: DINOv2 ----
-    torch.cuda.synchronize()
-    t0 = time.time()
-    with torch.no_grad():
-        with torch.amp.autocast('cuda', dtype=dtype, enabled=True):
-            patch_tokens_cpu, pooled_tokens = model.aggregator.forward_dino(images)
-    torch.cuda.synchronize()
-    timing['dino'] = time.time() - t0
-
-    # ---- Phase 1b: Similarity matrix ----
-    t0 = time.time()
-    feats = F.normalize(pooled_tokens, dim=-1)
-    sim_matrix = (feats @ feats.T).numpy()
-    del pooled_tokens, feats
-    timing['sim_matrix'] = time.time() - t0
-
-    # ---- Phase 1c: Anchor selection ----
-    precomputed_anchors = select_anchors(S, n_anchors, mode=anchor_select,
-                                         sim_matrix=sim_matrix, seed=seed)
-    timing['anchor_select'] = anchor_select
-
-    # ---- Phase 1d: Initial chunking (random + revsim LS) ----
-    t0 = time.time()
-    chunks, anchors_init, t_ls_initial = random_balanced_ls_revsim_split(
-        sim_matrix, chunk_size, n_anchors=n_anchors,
-        local_search_iters=ls_iters, seed=seed,
-        anchors_override=precomputed_anchors,
-    )
-    timing['initial_chunking'] = time.time() - t0
-    timing['initial_ls'] = t_ls_initial
-    initial_chunks = [list(ch) for ch in chunks]
-
-    # ---- Skipped: no 1st chunk inference or pseudo-pose ----
-    timing['first_chunk_inference'] = 0.0
-    timing['pseudo_pose_computation'] = 0.0
-
-    # ---- Phase 2a: GT pose weight matrix ----
-    t0 = time.time()
-    W_pose, tau_used = _compute_pose_weight_matrix_scaled(
-        gt_positions, tau=tau, tau_mult=tau_mult)
-    timing['pose_weight_computation'] = time.time() - t0
-
-    # ---- Phase 2b: Re-chunking with GT pose weights ----
-    t0 = time.time()
-    rechunked, anchors_new, t_ls_rechunk = rechunk_with_pose_weights(
-        chunks, anchors_init, sim_matrix, W_pose,
-        score_type=score_type, alpha=0.0,
-        combine_mode=combine_mode, alpha_combine=alpha_combine,
-        n_anchors=n_anchors, local_search_iters=ls_iters,
-        anchors_override=precomputed_anchors,
-    )
-    timing['rechunking_total'] = time.time() - t0
-    timing['rechunking_ls'] = t_ls_rechunk
-    rechunked_chunks = [list(ch) for ch in rechunked]
-
-    # ---- Phase 3 & 4: All-chunk inference + SE3 alignment ----
-    pred_se3, t_infer, t_align = _poseweight_allchunk_inference(
-        model, images, rechunked, anchors_new, device, dtype,
-        patch_tokens_cpu=patch_tokens_cpu,
-        align_mode=align_mode,
-    )
     timing['all_chunks_inference'] = t_infer
     timing['alignment'] = t_align
 
@@ -1438,7 +1183,6 @@ def run_inference(model, image_paths, device, dtype):
 # =============================================================================
 
 def evaluate_sequence(seq_dir, model, device, dtype, n_frames, thresholds,
-                      poseweight_mode=None, combine_mode="E",
                       gamma=0.001, tau=None, epsilon=None,
                       rechunk_remaining_only=False, seed=42):
     all_frames = get_sequence_frames(seq_dir)
@@ -1473,46 +1217,26 @@ def evaluate_sequence(seq_dir, model, device, dtype, n_frames, thresholds,
     # GT c2w matrix for poseweight GT mode
     gt_c2w_arr = np.stack([gt_c2w[i] for i in valid], axis=0)  # (N, 4, 4)
 
-    # ------ Pose-weighted re-chunking ------
-    if poseweight_mode in ("pseudo", "gt"):
+    # ------ Pose-weighted re-chunking (da_partitioning) ------
+    if model.aggregator.sampling_method == "da_partitioning":
         chunk_size = model.aggregator.sampling_max_frames
         if chunk_size <= 0:
             chunk_size = 50
         n_anchors = getattr(model.aggregator, 'sampling_n_anchors', 1)
         ls_iters = model.aggregator.sampling_local_search_iters
-        align_mode = getattr(model.aggregator, 'sampling_align_mode', 'sim3')
         anchor_select = getattr(model.aggregator, 'sampling_anchor_select', 'uniform')
 
-        if poseweight_mode == "pseudo":
-            (pred_se3, img_shape, num_chunks, timing,
-             initial_chunks, rechunked_chunks, sim_matrix, tau_used) = \
-                run_inference_poseweight(
-                    model, image_paths, device, dtype,
-                    combine_mode=combine_mode, alpha_combine=0.5,
-                    gamma=gamma, tau=tau, tau_mult=1.0,
-                    score_type="revsim", ls_iters=ls_iters,
-                    n_anchors=n_anchors, chunk_size=chunk_size,
-                    rechunk_remaining_only=rechunk_remaining_only,
-                    epsilon=epsilon,
-                    initial_ls_iters=None,
-                    align_mode=align_mode,
-                    anchor_select=anchor_select,
-                    seed=seed,
-                    rotation_cue="none", alpha_rot=None)
-        else:  # gt
-            gt_positions = gt_c2w_arr[:, :3, 3]
-            (pred_se3, img_shape, num_chunks, timing,
-             initial_chunks, rechunked_chunks, sim_matrix, tau_used) = \
-                run_inference_gtposeweight(
-                    model, image_paths, device, dtype,
-                    gt_positions,
-                    combine_mode=combine_mode, alpha_combine=0.5,
-                    tau=tau, tau_mult=1.0,
-                    score_type="revsim", ls_iters=ls_iters,
-                    n_anchors=n_anchors, chunk_size=chunk_size,
-                    align_mode=align_mode,
-                    anchor_select=anchor_select,
-                    seed=seed)
+        (pred_se3, img_shape, num_chunks, timing,
+         initial_chunks, rechunked_chunks, sim_matrix, tau_used) = \
+            run_inference_poseweight(
+                model, image_paths, device, dtype,
+                gamma=gamma, tau=tau,
+                score_type="revsim", ls_iters=ls_iters,
+                n_anchors=n_anchors, chunk_size=chunk_size,
+                rechunk_remaining_only=rechunk_remaining_only,
+                epsilon=epsilon,
+                anchor_select=anchor_select,
+                seed=seed)
 
         rra, rta = compute_relative_pose_errors(pred_se3, gt_se3, N)
         rra_np = rra.cpu().numpy()
@@ -1576,8 +1300,6 @@ def evaluate_sequence(seq_dir, model, device, dtype, n_frames, thresholds,
             'chunk_frame_indices': rechunked_chunks,
             'initial_chunk_frame_indices': initial_chunks,
             'tau_used': tau_used,
-            'combine_mode': combine_mode,
-            'poseweight_mode': poseweight_mode,
             'image_paths': image_paths,
             'pred_se3': _pred_se3_np,
             'gt_c2w': gt_c2w_arr,
@@ -1700,8 +1422,6 @@ def run_evaluation(model, args, dtype, device, scenes, thresholds):
             print(f"  {seq_name}: ", end="", flush=True)
             result = evaluate_sequence(
                 seq_dir, model, device, dtype, args.n_frames, thresholds,
-                poseweight_mode=getattr(args, 'poseweight_mode', None),
-                combine_mode=getattr(args, 'combine_mode', 'E'),
                 gamma=getattr(args, 'gamma', 0.001),
                 tau=getattr(args, 'tau', None),
                 epsilon=getattr(args, 'epsilon', None),
@@ -1964,26 +1684,22 @@ def main():
     parser.add_argument("--dataset_dir", type=str, required=True)
     parser.add_argument("--n_frames", type=int, default=200, help="Total frames to sample per sequence")
     parser.add_argument("--chunk_size", type=int, default=50, help="Max frames per chunk (sampling_max_frames)")
-    parser.add_argument("--sampling_method", type=str, default="random_ls_revsim",
-                        choices=["random", "origin", "random_ls_revsim"],
-                        help="Chunk sampling method. "
-                             "'random' = random balanced partitioning (no local search) baseline; "
-                             "'origin' = single-batch, no chunking; "
-                             "'random_ls_revsim' = diversity-aware local-search reverse-similarity split.")
+    parser.add_argument("--sampling_method", type=str, default="da_partitioning",
+                        choices=["da_partitioning", "random_partitioning", "origin"],
+                        help="View partitioning method: "
+                             "'da_partitioning' = diversity-aware partitioning (ours) — random "
+                             "split refined by 2-opt local search and pose-weighted re-chunking; "
+                             "'random_partitioning' = random partitioning without local search (baseline); "
+                             "'origin' = no partitioning, single full-sequence pass (baseline).")
     parser.add_argument("--local_search_iters", type=int, default=5,
-                        help="2-opt local search iterations for random_ls_revsim (0=skip)")
+                        help="2-opt local search iterations for da_partitioning (0=skip)")
     parser.add_argument("--scenes", nargs="+", default=None, help="Scenes to evaluate (default: all)")
     parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16", "float16"])
     parser.add_argument("--dino_batch_size", type=int, default=256, help="DINOv2 mini-batch size")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="./results_chunked_7scenes")
-    # Pose-weighted re-chunking
-    parser.add_argument("--poseweight_mode", type=str, default=None,
-                        choices=["pseudo", "gt"],
-                        help="Pose-weighted re-chunking: pseudo (1st chunk inference) or gt (GT poses)")
-    parser.add_argument("--combine_mode", type=str, default="E", choices=["E"],
-                        help="Score combination mode (E = epsilon-subtractive)")
+    # Pose-weighted re-chunking (used by sampling_method=da_partitioning)
     parser.add_argument("--gamma", type=float, default=0.001,
                         help="Softmax temperature for pseudo-pose soft assignment")
     parser.add_argument("--tau", type=float, default=None,
@@ -2010,9 +1726,9 @@ def main():
 
     model = load_model(device, args.model_path, args.chunk_size)
     model.aggregator.dino_batch_size = args.dino_batch_size
-    # 'random' is exposed as the random-balanced (no local search) baseline
+    # 'random_partitioning' maps to the aggregator's random-balanced split (no local search)
     model.aggregator.sampling_method = (
-        "random_balanced" if args.sampling_method == "random" else args.sampling_method)
+        "random_balanced" if args.sampling_method == "random_partitioning" else args.sampling_method)
     model.aggregator.sampling_local_search_iters = args.local_search_iters
 
     # Origin mode: disable chunking, run single-batch forward
@@ -2025,8 +1741,8 @@ def main():
     print(f"\n{'#'*60}")
     print(f"# VGGT Chunked Inference (sampling={args.sampling_method})")
     print(f"# n_frames={args.n_frames}, chunk_size={args.chunk_size}")
-    if args.poseweight_mode:
-        print(f"# poseweight_mode={args.poseweight_mode}, combine_mode={args.combine_mode}, "
+    if args.sampling_method == "da_partitioning":
+        print(f"# pose-weighted re-chunking: "
               f"gamma={args.gamma}, tau={args.tau}, epsilon={args.epsilon}")
         if args.rechunk_remaining_only:
             print(f"# rechunk_remaining_only=True")
@@ -2049,11 +1765,11 @@ def main():
             'global_summary': all_mode_summaries[mode_name],
         }
 
-    pair_suffix = f"_ls{args.local_search_iters}" if args.sampling_method == "random_ls_revsim" else ""
+    pair_suffix = f"_ls{args.local_search_iters}" if args.sampling_method == "da_partitioning" else ""
     anchor_suffix = "first_anchor"
     pw_suffix = ""
-    if args.poseweight_mode:
-        pw_suffix = f"_pw{args.poseweight_mode}_mode{args.combine_mode}_g{args.gamma}"
+    if args.sampling_method == "da_partitioning":
+        pw_suffix = f"_pw_g{args.gamma}"
         if args.epsilon is not None:
             pw_suffix += f"_eps{args.epsilon}"
         if args.rechunk_remaining_only:
