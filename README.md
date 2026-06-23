@@ -5,6 +5,18 @@
   <a href="https://JSP-ywu.github.io/DA-VGGT/"><img src="https://img.shields.io/badge/Project_Page-DA--VGGT-2088c1" alt="Project Page"></a>
 </p>
 
+<p align="center">
+  Jinsoo Park<sup>1</sup>,
+  Donggyu Choi<sup>2</sup>,
+  <a href="https://ahyunseo.github.io/">Ahyun Seo</a><sup>3</sup>,
+  <a href="https://cvlab.postech.ac.kr/~mcho/">Minsu Cho</a><sup>1,4</sup>,
+  <a href="https://jeanyson.github.io/">Jeany Son</a><sup>1</sup>
+</p>
+
+<p align="center">
+  <sup>1</sup>POSTECH&nbsp;&nbsp; <sup>2</sup>GIST&nbsp;&nbsp; <sup>3</sup>KAIST&nbsp;&nbsp; <sup>4</sup>RLWRLD
+</p>
+
 Official repository for **Diversity-Aware View Partitioning for Scalable VGGT**.
 
 DA-VGGT is a training-free, plug-and-play inference framework for VGGT that
