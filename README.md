@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  Jinsoo Park<sup>1</sup>,
+  <a href="https://jspark1213.github.io/">Jinsoo Park</a><sup>1</sup>,
   Donggyu Choi<sup>2</sup>,
   <a href="https://ahyunseo.github.io/">Ahyun Seo</a><sup>3</sup>,
   <a href="https://cvlab.postech.ac.kr/~mcho/">Minsu Cho</a><sup>1,4</sup>,
