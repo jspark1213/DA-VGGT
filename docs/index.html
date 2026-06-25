@@ -36,7 +36,51 @@
     /* Linked authors (personal homepages) in blue to signal they are clickable */
     .publication-authors a { color: #3273dc !important; font-weight: 600; }
     .publication-authors a:hover { color: #2057b8 !important; text-decoration: underline; }
+
+    /* ---- content sections ---- */
+    .section-title { font-family: 'Google Sans', sans-serif; }
+    .caption { color: #555; font-size: .95rem; }
+    figure.fig img { width: 100%; height: auto; border-radius: 6px; }
+    /* dashed placeholder used until real figures/videos are added */
+    .placeholder-box {
+      display: flex; align-items: center; justify-content: center;
+      width: 100%; min-height: 240px; border: 2px dashed #c8c8d0;
+      border-radius: 8px; color: #9a9aa6; background: #fafafc;
+      font-size: .9rem; text-align: center; padding: 1rem;
+    }
+    .video-wrap { position: relative; padding-top: 56.25%; border-radius: 8px; overflow: hidden; background: #fafafc; }
+    .video-wrap > * { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+    /* live point-cloud viewer */
+    .viewer { position: relative; width: 100%; height: 440px; border-radius: 8px; overflow: hidden; background: #0e0e12; cursor: grab; }
+    .viewer:active { cursor: grabbing; }
+    .viewer canvas { display: block; width: 100%; height: 100%; }
+    .viewer .viewer-msg {
+      position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+      color: #cfcfd6; font-size: .9rem; text-align: center; padding: 1rem;
+      white-space: pre-line; pointer-events: none;
+    }
+    .viewer-label { font-family: 'Google Sans', sans-serif; }
+    .bibtex pre { background: #f5f5f7; border-radius: 8px; padding: 1.1rem; overflow: auto; }
+
+    /* Mobile: scale down the large title/venue and tighten vertical padding */
+    @media screen and (max-width: 768px) {
+      .hero-body { padding-top: 2.5rem; padding-bottom: 2.5rem; }
+      .publication-title.is-1 { font-size: 1.9rem; }
+      .venue.is-size-4 { font-size: 1.15rem !important; }
+      .publication-authors.is-size-5 { font-size: 1rem !important; }
+      .viewer { height: 320px; }
+    }
   </style>
+
+  <!-- Three.js — powers the interactive point-cloud viewer (drag to rotate, scroll to zoom) -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
 </head>
 
 <body>
@@ -91,7 +135,231 @@
     </div>
   </section>
 
-  <!-- Content sections go here (TBD) -->
+  <!-- ============================ ABSTRACT ============================ -->
+  <section class="section">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered section-title">Abstract</h2>
+      <div class="content has-text-justified is-size-5-tablet">
+        <p>
+          Geometry transformers such as VGGT achieve strong performance by jointly
+          reasoning over multiple views with global attention. However, scaling them
+          to large view collections remains challenging due to the quadratic cost of
+          attention. Moreover, our empirical analysis reveals that reconstruction
+          quality in VGGT is sensitive to the distribution of viewpoints: simply
+          increasing the number of views without sufficient viewpoint diversity can
+          even degrade performance, as redundant views introduce highly similar tokens
+          that dilute informative geometric signals in the attention mechanism.
+          Motivated by this observation, we propose a <b>training-free</b> and
+          <b>plug-and-play</b> VGGT inference framework that organizes input views into
+          <b>diversity-aware balanced subsets</b>, constructed through combinatorial
+          graph partitioning over visual dissimilarity and spatial dispersion. This
+          view organization lets the transformer focus attention on geometrically
+          informative views while reducing redundant attention interactions. To
+          estimate spatial dispersion without full pose estimation, we approximate
+          pseudo spatial relationships via a soft pose-propagation strategy based on
+          visual similarity from a small set of seed frames. Extensive experiments show
+          improved camera pose estimation, multi-view depth prediction, and 3D
+          reconstruction while reducing memory usage and inference latency. Our
+          framework also complements existing VGGT variants, enabling scalable
+          multi-view reconstruction without sacrificing geometric fidelity.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== MAIN CONTRIBUTION FIGURES ==================== -->
+  <section class="section">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered section-title">Main Contribution</h2>
+
+      <!-- TODO: replace placeholder with static/images/figure1.png (PDF Figure 1) -->
+      <figure class="fig">
+        <div class="placeholder-box">[ Figure 1 ]&nbsp;&nbsp;static/images/figure1.png</div>
+      </figure>
+      <p class="caption has-text-centered mt-3">
+        <b>Figure 1.</b> Motivation — viewpoint diversity vs. reconstruction quality.
+      </p>
+
+      <!-- TODO: replace placeholder with static/images/figure2.png (PDF Figure 2) -->
+      <figure class="fig mt-6">
+        <div class="placeholder-box">[ Figure 2 ]&nbsp;&nbsp;static/images/figure2.png</div>
+      </figure>
+      <p class="caption has-text-centered mt-3">
+        <b>Figure 2.</b> Overview of diversity-aware view partitioning.
+      </p>
+    </div>
+  </section>
+
+  <!-- ========================= PIPELINE VIDEO ========================== -->
+  <section class="section">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered section-title">Pipeline</h2>
+      <!-- TODO: drop in static/videos/pipeline.mp4 and swap the placeholder for the <video> below -->
+      <div class="video-wrap">
+        <div class="placeholder-box">[ Pipeline video ]&nbsp;&nbsp;static/videos/pipeline.mp4</div>
+        <!--
+        <video controls autoplay muted loop playsinline poster="static/images/pipeline_poster.png">
+          <source src="static/videos/pipeline.mp4" type="video/mp4">
+        </video>
+        -->
+      </div>
+      <p class="caption has-text-centered mt-3">
+        Animated walkthrough of the partitioning &amp; reconstruction pipeline (PDF Figure 3).
+      </p>
+    </div>
+  </section>
+
+  <!-- ==================== INTERACTIVE 3D RESULTS ======================= -->
+  <section class="section">
+    <div class="container is-max-widescreen">
+      <h2 class="title is-3 has-text-centered section-title">Interactive 3D Reconstruction</h2>
+      <p class="has-text-centered caption">
+        Drag to rotate · scroll to zoom · right-drag to pan.
+      </p>
+
+      <div class="has-text-centered my-4">
+        <div class="select is-rounded">
+          <select id="scene-select" aria-label="Select scene"></select>
+        </div>
+      </div>
+
+      <div class="columns is-variable is-4">
+        <div class="column">
+          <p class="has-text-centered has-text-weight-bold viewer-label mb-2">Ours (DA-VGGT)</p>
+          <div class="viewer" id="viewer-ours"><div class="viewer-msg"></div></div>
+        </div>
+        <div class="column">
+          <p class="has-text-centered has-text-weight-bold viewer-label mb-2">Baseline (VGGT)</p>
+          <div class="viewer" id="viewer-base"><div class="viewer-msg"></div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================= BIBTEX ============================== -->
+  <section class="section bibtex">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered section-title">BibTeX</h2>
+      <pre><code>TBD</code></pre>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <div class="content has-text-centered">
+      <p>
+        Page template borrowed from
+        <a href="https://github.com/nerfies/nerfies.github.io">Nerfies</a>.
+      </p>
+    </div>
+  </footer>
+
+  <!-- ================== interactive point-cloud viewer ================= -->
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { PLYLoader } from 'three/addons/loaders/PLYLoader.js';
+
+    class PointCloudViewer {
+      constructor(container) {
+        this.container = container;
+        this.msgEl = container.querySelector('.viewer-msg');
+
+        this.scene = new THREE.Scene();
+        this.scene.background = new THREE.Color(0x0e0e12);
+
+        this.camera = new THREE.PerspectiveCamera(50, 1, 0.001, 1000);
+        this.camera.position.set(0, 0, 2.4);
+
+        this.renderer = new THREE.WebGLRenderer({ antialias: true });
+        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        this.container.appendChild(this.renderer.domElement);
+
+        this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+        this.controls.enableDamping = true;
+        this.controls.dampingFactor = 0.08;
+
+        this.loader = new PLYLoader();
+        this.points = null;
+
+        this._resize();
+        new ResizeObserver(() => this._resize()).observe(this.container);
+        this.renderer.setAnimationLoop(() => {
+          this.controls.update();
+          this.renderer.render(this.scene, this.camera);
+        });
+      }
+
+      _resize() {
+        const w = this.container.clientWidth || 1;
+        const h = this.container.clientHeight || 1;
+        this.renderer.setSize(w, h, false);
+        this.camera.aspect = w / h;
+        this.camera.updateProjectionMatrix();
+      }
+
+      _setMsg(t) { if (this.msgEl) this.msgEl.textContent = t || ''; }
+
+      load(url) {
+        if (this.points) {
+          this.scene.remove(this.points);
+          this.points.geometry.dispose();
+          this.points.material.dispose();
+          this.points = null;
+        }
+        this._setMsg('Loading…');
+        this.loader.load(
+          url,
+          (geo) => {
+            geo.computeBoundingBox();
+            const center = new THREE.Vector3();
+            geo.boundingBox.getCenter(center);
+            geo.translate(-center.x, -center.y, -center.z);
+            const size = geo.boundingBox.getSize(new THREE.Vector3()).length() || 1;
+            const s = 1.6 / size;
+            geo.scale(s, s, s);
+
+            const hasColor = !!geo.getAttribute('color');
+            const material = new THREE.PointsMaterial({
+              size: 0.0075, sizeAttenuation: true,
+              vertexColors: hasColor, color: hasColor ? 0xffffff : 0x7fb2ff,
+            });
+            this.points = new THREE.Points(geo, material);
+            this.scene.add(this.points);
+            this.camera.position.set(0, 0, 2.4);
+            this.controls.target.set(0, 0, 0);
+            this.controls.update();
+            this._setMsg('');
+          },
+          undefined,
+          () => this._setMsg('Point cloud not found.\nAdd the .ply file to enable the viewer.')
+        );
+      }
+    }
+
+    // --- Edit this list: one entry per comparison scene, pointing to your .ply files ---
+    const SCENES = [
+      { name: 'Scene 1', ours: 'static/pointclouds/scene1_ours.ply', baseline: 'static/pointclouds/scene1_vggt.ply' },
+      { name: 'Scene 2', ours: 'static/pointclouds/scene2_ours.ply', baseline: 'static/pointclouds/scene2_vggt.ply' },
+    ];
+
+    const oursViewer = new PointCloudViewer(document.getElementById('viewer-ours'));
+    const baseViewer = new PointCloudViewer(document.getElementById('viewer-base'));
+    const select = document.getElementById('scene-select');
+
+    SCENES.forEach((s, i) => {
+      const opt = document.createElement('option');
+      opt.value = String(i);
+      opt.textContent = s.name;
+      select.appendChild(opt);
+    });
+
+    function loadScene(i) {
+      oursViewer.load(SCENES[i].ours);
+      baseViewer.load(SCENES[i].baseline);
+    }
+    select.addEventListener('change', (e) => loadScene(Number(e.target.value)));
+    loadScene(0);
+  </script>
 
 </body>
 </html>
