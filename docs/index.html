@@ -172,20 +172,27 @@
     <div class="container is-max-desktop">
       <h2 class="title is-3 has-text-centered section-title">Main Contribution</h2>
 
-      <!-- TODO: replace placeholder with static/images/figure1.png (PDF Figure 1) -->
+      <!-- Figure 1 = assets/fig1_ver8.png (PDF Figure 1) -->
       <figure class="fig">
-        <div class="placeholder-box">[ Figure 1 ]&nbsp;&nbsp;static/images/figure1.png</div>
+        <img src="assets/fig1_ver8.png" alt="Figure 1: Effectiveness of diversity-aware view partitioning">
       </figure>
       <p class="caption has-text-centered mt-3">
-        <b>Figure 1.</b> Motivation — viewpoint diversity vs. reconstruction quality.
+        <b>Diversity-aware partitioning improves reconstruction and scaling.</b>
+        (a) Dropped into VGGT and LiteVGGT, our method recovers cleaner, more detailed
+        3D structure. (b) Adding more frames slows prior methods down and even hurts
+        their accuracy — ours stays accurate with a far better speed–accuracy trade-off.
       </p>
 
-      <!-- TODO: replace placeholder with static/images/figure2.png (PDF Figure 2) -->
+      <!-- Figure 2 = assets/fig_motiv.png (PDF Figure 2) -->
       <figure class="fig mt-6">
-        <div class="placeholder-box">[ Figure 2 ]&nbsp;&nbsp;static/images/figure2.png</div>
+        <img src="assets/fig_motiv.png" alt="Figure 2: Impact of frame count on VGGT performance">
       </figure>
       <p class="caption has-text-centered mt-3">
-        <b>Figure 2.</b> Overview of diversity-aware view partitioning.
+        <b>More frames don't always help.</b>
+        Adding views can increase error: high-error regions (red) are dominated by
+        near-duplicate views, while low-error regions (green) come from diverse
+        viewpoints — motivating partitioning by viewpoint diversity rather than sheer
+        frame count.
       </p>
     </div>
   </section>
