@@ -40,6 +40,7 @@
     /* ---- content sections ---- */
     .section-title { font-family: 'Google Sans', sans-serif; }
     .caption { color: #555; font-size: .95rem; }
+    figure.fig { max-width: 760px; margin-inline: auto; }
     figure.fig img { width: 100%; height: auto; border-radius: 6px; }
     /* dashed placeholder used until real figures/videos are added */
     .placeholder-box {
@@ -191,8 +192,7 @@
         <b>More frames don't always help.</b>
         Adding views can increase error: high-error regions (red) are dominated by
         near-duplicate views, while low-error regions (green) come from diverse
-        viewpoints — motivating partitioning by viewpoint diversity rather than sheer
-        frame count.
+        viewpoints — motivating partitioning by diversity, not frame count.
       </p>
     </div>
   </section>
@@ -240,6 +240,15 @@
           <div class="viewer" id="viewer-base"><div class="viewer-msg"></div></div>
         </div>
       </div>
+
+      <p class="caption has-text-centered mt-4">
+        Reconstructions shown on the
+        <a href="https://arxiv.org/abs/2104.04532">Neural RGB-D</a> [Azinović <i>et al.</i>, CVPR 2022]
+        and <a href="http://www.scan-net.org/">ScanNet</a> [Dai <i>et al.</i>, CVPR 2017] datasets.
+        We build on and compare against
+        <a href="https://vgg-t.github.io/">VGGT</a> [Wang <i>et al.</i>, CVPR 2025]
+        and LiteVGGT [Shu <i>et al.</i>, CVPR 2026].
+      </p>
     </div>
   </section>
 
@@ -376,10 +385,10 @@
     const SCENES = [
       { name: 'Breakfast Room (Neural RGB-D)',
         ours: 'assets/pointclouds/scene1_ours.ply', baseline: 'assets/pointclouds/scene1_vggt.ply',
-        view: { pos: [0, 0, 2.4], target: [0, 0, 0], up: [0, 1, 0] } },
+        view: { pos: [0.083, -0.323, 0.824], target: [0, 0, 0], up: [-0.029, 0.929, 0.368] } },
       { name: 'ScanNet scene0307_01',
         ours: 'assets/pointclouds/scene2_ours.ply', baseline: 'assets/pointclouds/scene2_vggt.ply',
-        view: { pos: [0, 0, 2.4], target: [0, 0, 0], up: [0, 1, 0] } },
+        view: { pos: [-0.035, 0.899, 0.349], target: [0, 0, 0], up: [-0.415, -0.343, 0.843] } },
     ];
 
     const oursViewer = new PointCloudViewer(document.getElementById('viewer-ours'));
