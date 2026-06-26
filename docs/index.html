@@ -24,13 +24,6 @@
     }
     .publication-links .button:hover { background-color: #000; }
     .venue { font-weight: 700; letter-spacing: .03em; }
-    .venue-text {
-      background: linear-gradient(90deg, #ff6b6b, #f06595, #cc5de8, #5c7cfa);
-      -webkit-background-clip: text;
-      background-clip: text;
-      color: transparent;
-      -webkit-text-fill-color: transparent;
-    }
     .publication-authors { font-family: 'Google Sans', sans-serif; }
     .publication-authors .author-block { display: inline-block; margin: 0 .2rem; }
     /* Linked authors (personal homepages) in blue to signal they are clickable */
@@ -42,6 +35,9 @@
     .caption { color: #555; font-size: .95rem; }
     figure.fig { max-width: 760px; margin-inline: auto; }
     figure.fig img { width: 100%; height: auto; border-radius: 6px; }
+    /* enlarged figure (~1.4x): allowed to break slightly past the text column */
+    figure.fig-lg { width: min(1064px, 94vw); max-width: none; margin-inline: 0;
+                    position: relative; left: 50%; transform: translateX(-50%); }
     /* dashed placeholder used until real figures/videos are added */
     .placeholder-box {
       display: flex; align-items: center; justify-content: center;
@@ -95,7 +91,7 @@
               Diversity-Aware View Partitioning for Scalable VGGT
             </h1>
 
-            <p class="venue is-size-4 mt-4">🎉&nbsp;<span class="venue-text">ECCV 2026</span>&nbsp;🎉</p>
+            <p class="venue is-size-4 mt-4">ECCV 2026</p>
 
             <!-- Authors -->
             <div class="is-size-5 publication-authors mt-5">
@@ -185,7 +181,7 @@
       </p>
 
       <!-- Figure 2 = assets/fig_motiv.png (PDF Figure 2) -->
-      <figure class="fig mt-6">
+      <figure class="fig fig-lg mt-6">
         <img src="assets/fig_motiv.png" alt="Figure 2: Impact of frame count on VGGT performance">
       </figure>
       <p class="caption has-text-centered mt-3">
@@ -244,7 +240,7 @@
       <p class="caption has-text-centered mt-4">
         Reconstructions shown on the
         <a href="https://arxiv.org/abs/2104.04532">Neural RGB-D</a> [Azinović <i>et al.</i>, CVPR 2022]
-        and <a href="http://www.scan-net.org/">ScanNet</a> [Dai <i>et al.</i>, CVPR 2017] datasets.
+        and <a href="http://www.scan-net.org/">ScanNet</a> [Dai <i>et al.</i>, CVPR 2017] datasets.<br>
         We build on and compare against
         <a href="https://vgg-t.github.io/">VGGT</a> [Wang <i>et al.</i>, CVPR 2025]
         and LiteVGGT [Shu <i>et al.</i>, CVPR 2026].
