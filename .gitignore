@@ -9,3 +9,5 @@ __pycache__/
 *.pyc
 
 # Not be committed
+docs/assets/scene1_ply
+docs/assets/scene2_ply
