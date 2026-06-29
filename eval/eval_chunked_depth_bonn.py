@@ -232,74 +232,6 @@ def compute_depth_metrics_with_scale(pred_depth, gt_depth, scale,
 
 
 # =============================================================================
-# Chunking quality metrics (same as pose eval)
-# =============================================================================
-
-def compute_chunking_quality_metrics(sim_matrix, chunks):
-    """Compute chunking quality metrics from similarity matrix and chunks."""
-    N = sim_matrix.shape[0]
-    K = len(chunks)
-    sim = np.clip(sim_matrix, 0, None)
-
-    per_chunk_cov = np.array([
-        sim[:, chunk].max(axis=1).sum() if len(chunk) > 0 else 0.0
-        for chunk in chunks
-    ])
-
-    coverage_profiles = np.zeros((K, N), dtype=np.float32)
-    for k, chunk in enumerate(chunks):
-        if len(chunk) > 0:
-            coverage_profiles[k] = sim[:, chunk].max(axis=1)
-    per_frame_var = float(coverage_profiles.var(axis=0).mean())
-    chunk_total_var = float(coverage_profiles.sum(axis=1).var())
-
-    diversities = []
-    for chunk in chunks:
-        if len(chunk) < 2:
-            diversities.append(0.0)
-            continue
-        chunk_sim = sim[np.ix_(chunk, chunk)]
-        triu_idx = np.triu_indices(len(chunk), k=1)
-        diversities.append(float(1.0 - chunk_sim[triu_idx].mean()))
-    diversity = np.array(diversities)
-
-    # --- Pair Utility Coverage: f_ucov(C_k) = sum_i max_{j in C_k} u(sim(i,j)) ---
-    alpha_metric = 0.7
-    sim_safe_m = np.clip(sim, 1e-8, 1.0 - 1e-8)
-    U_m = np.power(sim_safe_m, alpha_metric) * np.power(1.0 - sim_safe_m, 1.0 - alpha_metric)
-    np.fill_diagonal(U_m, 0.0)
-
-    per_chunk_ucov = np.array([
-        U_m[:, chunk].max(axis=1).sum() if len(chunk) > 0 else 0.0
-        for chunk in chunks
-    ])
-
-    # --- Within-chunk Pair Quality ---
-    pair_qualities = []
-    for chunk in chunks:
-        if len(chunk) < 2:
-            pair_qualities.append(0.0)
-            continue
-        chunk_U = U_m[np.ix_(chunk, chunk)]
-        triu_idx = np.triu_indices(len(chunk), k=1)
-        pair_qualities.append(float(chunk_U[triu_idx].mean()))
-    pair_quality = np.array(pair_qualities)
-
-    return {
-        'coverage_mean': float(per_chunk_cov.mean()),
-        'coverage_std': float(per_chunk_cov.std()),
-        'coverage_min': float(per_chunk_cov.min()),
-        'per_frame_coverage_variance': per_frame_var,
-        'chunk_total_coverage_variance': chunk_total_var,
-        'diversity_mean': float(diversity.mean()),
-        'utility_coverage_mean': float(per_chunk_ucov.mean()),
-        'utility_coverage_min': float(per_chunk_ucov.min()),
-        'pair_quality_mean': float(pair_quality.mean()),
-        'pair_quality_min': float(pair_quality.min()),
-    }
-
-
-# =============================================================================
 # Model
 # =============================================================================
 
@@ -743,8 +675,6 @@ def evaluate_scene(scene_name, scene_path, model, device, dtype, n_frames,
             rechunk_remaining_only=rechunk_remaining_only,
             epsilon=epsilon,
             anchor_select="uniform", seed=seed)
-        anchor = anchors[0] if anchors else None
-        chunk_frame_indices = rechunked_chunks
     else:
         depth_pred, depth_conf, img_shape, num_chunks, anchor, anchors, timing, \
             sim_matrix, chunk_frame_indices, depth_chunk_scales = \
@@ -820,38 +750,6 @@ def evaluate_scene(scene_name, scene_path, model, device, dtype, n_frames,
     del frame_valid_data, depth_pred, depth_conf
     torch.cuda.empty_cache()
 
-    # Per-chunk depth evaluation
-    per_chunk_eval = []
-    if chunk_frame_indices is not None and len(chunk_frame_indices) > 1:
-        for k, chunk_idx_list in enumerate(chunk_frame_indices):
-            chunk_metrics = [per_frame_metrics[i] for i in chunk_idx_list if per_frame_metrics[i] is not None]
-            chunk_global = [per_frame_global_metrics[i] for i in chunk_idx_list if per_frame_global_metrics[i] is not None]
-            if chunk_metrics:
-                c_abs_rel = float(np.mean([m['abs_rel'] for m in chunk_metrics]))
-                c_delta_1 = float(np.mean([m['delta_1'] for m in chunk_metrics]))
-            else:
-                c_abs_rel = None
-                c_delta_1 = None
-            if chunk_global:
-                c_g_abs_rel = float(np.mean([m['abs_rel'] for m in chunk_global]))
-                c_g_delta_1 = float(np.mean([m['delta_1'] for m in chunk_global]))
-            else:
-                c_g_abs_rel = None
-                c_g_delta_1 = None
-            per_chunk_eval.append({
-                'chunk_id': k,
-                'n_frames': len(chunk_idx_list),
-                'abs_rel': c_abs_rel,
-                'delta_1': c_delta_1,
-                'global_abs_rel': c_g_abs_rel,
-                'global_delta_1': c_g_delta_1,
-            })
-
-    # Chunking quality metrics
-    chunking_metrics = None
-    if sim_matrix is not None and chunk_frame_indices is not None:
-        chunking_metrics = compute_chunking_quality_metrics(sim_matrix, chunk_frame_indices)
-
     return {
         'abs_rel': mean_abs_rel,
         'delta_1': mean_delta_1,
@@ -865,18 +763,7 @@ def evaluate_scene(scene_name, scene_path, model, device, dtype, n_frames,
         'total_valid_pixels': total_valid_pixels,
         'n_total_frames': len(all_frames),
         'num_chunks': num_chunks,
-        'anchor': anchor,
-        'anchors': anchors,
-        'depth_chunk_scales': depth_chunk_scales,
         'timing': timing,
-        'chunking_metrics': chunking_metrics,
-        'per_chunk_eval': per_chunk_eval,
-        'per_frame_abs_rel': [m['abs_rel'] if m else None for m in per_frame_metrics],
-        'per_frame_delta_1': [m['delta_1'] if m else None for m in per_frame_metrics],
-        'per_frame_global_abs_rel': [m['abs_rel'] if m else None for m in per_frame_global_metrics],
-        'per_frame_global_delta_1': [m['delta_1'] if m else None for m in per_frame_global_metrics],
-        'chunk_frame_indices': chunk_frame_indices,
-        'image_paths': image_paths,
     }
 
 
@@ -956,15 +843,15 @@ def main():
 
     all_results = {}
     global_timings = []
-    chunk_assignments = []  # (scene_name, chunk_frame_indices, image_paths)
 
-    GREEN, BLUE, BOLD, RED, RESET = "\033[92m", "\033[94m", "\033[1m", "\033[91m", "\033[0m"
 
     print(f"\n{'#'*60}")
-    print(f"# Chunked Depth Eval (Bonn RGBD, sampling={args.sampling_method})")
-    print(f"# n_frames={args.n_frames}, chunk_size={args.chunk_size}, "
-          f"local_search_iters={args.local_search_iters}, dino_batch_size={args.dino_batch_size}")
+    print(f"# VGGT Chunked Depth Eval (Bonn, sampling={args.sampling_method})")
+    print(f"# n_frames={args.n_frames}, chunk_size={args.chunk_size}")
     print(f"# depth range=[{args.min_depth}, {args.max_depth}]m")
+    if args.sampling_method == "da_partitioning":
+        print(f"# pose-weighted re-chunking: gamma={args.gamma}, tau={args.tau}, "
+              f"epsilon={args.epsilon}, rechunk_remaining_only={args.rechunk_remaining_only}")
     print(f"{'#'*60}\n")
 
     for scene_name in scenes:
@@ -989,17 +876,6 @@ def main():
             continue
 
         chunk_info = f"K={result['num_chunks']}"
-        if result.get('anchors') is not None and len(result['anchors']) > 1:
-            chunk_info += f", anchors={result['anchors']}"
-        elif result['anchor'] is not None:
-            chunk_info += f", anchor={result['anchor']}"
-
-        # Depth scale diagnostics
-        scales = result.get('depth_chunk_scales')
-        if scales and len(scales) > 1:
-            scale_std = float(np.std(scales))
-            scale_range = f"{min(scales):.4f}~{max(scales):.4f}"
-            chunk_info += f", depth_scales={scale_range} (std={scale_std:.4f})"
 
         t = result['timing']
         if t is not None and 'first_chunk_inference' in t:
@@ -1040,30 +916,17 @@ def main():
             timing_str = "total=N/A"
             vram_str = ""
 
-        print(f"\n  {BOLD}{BLUE}{scene_name} (n={result['n_frames']}/{result['n_total_frames']}, "
-              f"{chunk_info}):{RESET}")
-        print(f"  {GREEN}abs_rel={result['abs_rel']:.4f}, delta<1.25={result['delta_1']:.4f}{RESET}  (per-image scale)")
+        print(f"\n  {scene_name} (n={result['n_frames']}/{result['n_total_frames']}, "
+              f"{chunk_info}):")
+        print(f"  abs_rel={result['abs_rel']:.4f}, delta<1.25={result['delta_1']:.4f}  (per-image scale)")
         if result.get('global_abs_rel') is not None:
-            print(f"  {GREEN}abs_rel={result['global_abs_rel']:.4f}, delta<1.25={result['global_delta_1']:.4f}{RESET}  (global scale={result['global_scale']:.4f})")
+            print(f"  abs_rel={result['global_abs_rel']:.4f}, delta<1.25={result['global_delta_1']:.4f}  (global scale={result['global_scale']:.4f})")
         print(f"  median_scale: mean={result['median_scale_mean']:.4f}, std={result['median_scale_std']:.4f}")
         print(f"  valid_frames={result['n_valid_frames']}/{result['n_frames']}, "
               f"valid_pixels={result['total_valid_pixels']}")
         print(f"  {timing_str}")
         if vram_str:
             print(f"  {vram_str}")
-
-        # Per-chunk evaluation
-        if result.get('per_chunk_eval'):
-            print(f"\n  {BOLD}Per-chunk evaluation:{RESET}")
-            for ce in result['per_chunk_eval']:
-                if ce['abs_rel'] is not None:
-                    g_str = ""
-                    if ce.get('global_abs_rel') is not None:
-                        g_str = f"  global: abs_rel={ce['global_abs_rel']:.4f}, d<1.25={ce['global_delta_1']:.4f}"
-                    print(f"    Chunk {ce['chunk_id']} (n={ce['n_frames']:>3}): "
-                          f"{GREEN}abs_rel={ce['abs_rel']:.4f}, d<1.25={ce['delta_1']:.4f}{RESET}{g_str}")
-                else:
-                    print(f"    Chunk {ce['chunk_id']} (n={ce['n_frames']:>3}): no valid frames")
 
         # Serialize timing
         timing_save = None
@@ -1084,32 +947,24 @@ def main():
             'total_valid_pixels': result['total_valid_pixels'],
             'n_total_frames': result['n_total_frames'],
             'num_chunks': result['num_chunks'],
-            'anchor': result['anchor'],
-            'anchors': result.get('anchors'),
-            'depth_chunk_scales': result.get('depth_chunk_scales'),
             'timing': timing_save,
-            'chunking_metrics': result.get('chunking_metrics'),
-            'per_chunk_eval': result.get('per_chunk_eval', []),
         }
 
         all_results[scene_name] = {'summary': scene_summary}
-
-        if result.get('chunk_frame_indices') is not None:
-            chunk_assignments.append((scene_name, result['chunk_frame_indices'], result['image_paths']))
 
         # Running mean
         evaluated = [s for s in all_results if all_results[s]['summary'] is not None]
         if len(evaluated) > 1:
             mean_abs_rel = np.mean([all_results[s]['summary']['abs_rel'] for s in evaluated])
             mean_delta_1 = np.mean([all_results[s]['summary']['delta_1'] for s in evaluated])
-            print(f"  {BOLD}{BLUE}Mean so far ({len(evaluated)} scenes):{RESET} "
-                  f"{RED}abs_rel={mean_abs_rel:.4f}, delta<1.25={mean_delta_1:.4f}{RESET}  (per-image)")
+            print(f"  Mean so far ({len(evaluated)} scenes): "
+                  f"abs_rel={mean_abs_rel:.4f}, delta<1.25={mean_delta_1:.4f}  (per-image)")
             eval_g = [s for s in evaluated if all_results[s]['summary'].get('global_abs_rel') is not None]
             if eval_g:
                 mg_ar = np.mean([all_results[s]['summary']['global_abs_rel'] for s in eval_g])
                 mg_d1 = np.mean([all_results[s]['summary']['global_delta_1'] for s in eval_g])
                 print(f"  {' ' * len(f'Mean so far ({len(evaluated)} scenes):')}"
-                      f"  {RED}abs_rel={mg_ar:.4f}, delta<1.25={mg_d1:.4f}{RESET}  (global)")
+                      f"  abs_rel={mg_ar:.4f}, delta<1.25={mg_d1:.4f}  (global)")
 
     # =========================================================================
     # Global summary
@@ -1157,16 +1012,6 @@ def main():
         g_ar_mean = f"{mean_g_ar:.4f}" if mean_g_ar is not None else "N/A"
         g_d1_mean = f"{mean_g_d1:.4f}" if mean_g_d1 is not None else "N/A"
         print(f"{'MEAN':<45} {mean_ar:<10.4f} {mean_d1:<10.4f} {g_ar_mean:<10} {g_d1_mean:<10}")
-
-        # Scale consistency summary
-        all_scales = []
-        for s in scene_results:
-            sc = scene_results[s].get('depth_chunk_scales')
-            if sc and len(sc) > 1:
-                all_scales.append(np.std(sc))
-        if all_scales:
-            print(f"\n  Depth scale consistency (std of per-chunk scales):")
-            print(f"    mean_std = {np.mean(all_scales):.4f}, max_std = {np.max(all_scales):.4f}")
 
         # Global timing summary
         if global_timings:
@@ -1230,37 +1075,20 @@ def main():
     anchor_suffix = "first_anchor"
     pw_suffix = ""
     if args.sampling_method == "da_partitioning":
-        pw_suffix = f"_pw"
-        if args.tau is not None:
-            pw_suffix += f"_tau{args.tau}"
+        pw_suffix = f"_pw_g{args.gamma}"
         if args.epsilon is not None:
             pw_suffix += f"_eps{args.epsilon}"
         if args.rechunk_remaining_only:
-            pw_suffix += "_remonly"
-        pw_suffix += f"_g{args.gamma}"
+            pw_suffix += "_ro"
     name_core = (f"{args.sampling_method}_n{args.n_frames}_c{args.chunk_size}"
                  f"_l0.0{pair_suffix}{anchor_suffix}{pw_suffix}")
     if args.scenes:
-        json_path = output_dir / f"depth_{args.scenes[0]}_{name_core}.json"
+        json_path = output_dir / f"chunked_depth_{args.scenes[0]}_{name_core}.json"
     else:
-        json_path = output_dir / f"depth_{name_core}.json"
+        json_path = output_dir / f"chunked_depth_{name_core}.json"
     with open(json_path, 'w') as f:
-        json.dump(save_data, f, indent=2)
+        json.dump(save_data, f, indent=2, default=str)
     print(f"\nResults saved to {json_path}")
-
-    # Save chunk assignments as txt
-    if chunk_assignments:
-        txt_path = json_path.with_suffix('.txt')
-        with open(txt_path, 'w') as f:
-            for scene_name, chunk_indices, image_paths in chunk_assignments:
-                f.write(f"Scene: {scene_name}\n")
-                for k, chunk in enumerate(chunk_indices):
-                    sorted_chunk = sorted(chunk)
-                    f.write(f"  Chunk {k} ({len(sorted_chunk)} frames):\n")
-                    for idx in sorted_chunk:
-                        f.write(f"    [{idx:4d}] {os.path.basename(image_paths[idx])}\n")
-                f.write("\n")
-        print(f"Chunk assignments saved to {txt_path}")
 
 
 if __name__ == "__main__":

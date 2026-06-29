@@ -98,231 +98,9 @@ def calculate_auc(r_errors, t_errors, thresholds=[3, 5, 15, 30]):
     return auc
 
 
-def compute_ate_metrics(pred_se3_np, gt_c2w_np):
-    """Compute ATE (Absolute Trajectory Error) after Umeyama alignment.
-
-    Args:
-        pred_se3_np: (N, 4, 4) numpy w2c SE3 matrices (predicted).
-        gt_c2w_np: (N, 4, 4) numpy c2w matrices (ground truth).
-
-    Returns:
-        dict with ate_rmse, ate_mean, ate_median, ate_max, scale.
-    """
-    gt_centers = gt_c2w_np[:, :3, 3]
-    R = pred_se3_np[:, :3, :3]
-    t = pred_se3_np[:, :3, 3]
-    pred_centers_raw = -np.einsum('nij,nj->ni', R.transpose(0, 2, 1), t)
-    pred_centers, s_align, _, _ = umeyama_alignment(pred_centers_raw, gt_centers)
-    errors = np.linalg.norm(pred_centers - gt_centers, axis=-1)
-    return {
-        'ate_rmse': float(np.sqrt(np.mean(errors ** 2))),
-        'ate_mean': float(np.mean(errors)),
-        'ate_median': float(np.median(errors)),
-        'ate_max': float(np.max(errors)),
-        'scale': float(s_align),
-    }
-
-
-def compute_rpe_metrics(pred_se3, gt_se3, image_paths=None):
-    """Compute RPE (Relative Pose Error) for consecutive frame pairs.
-
-    Args:
-        pred_se3: (N, 4, 4) tensor w2c SE3 matrices (predicted).
-        gt_se3: (N, 4, 4) tensor w2c SE3 matrices (ground truth).
-        image_paths: optional list of image paths for sorting (ensures meaningful consecutive pairs).
-
-    Returns:
-        dict with rpe_trans_mean/median and rpe_rot_mean/median (degrees).
-    """
-    N = pred_se3.shape[0]
-    if N < 2:
-        return {'rpe_trans_mean': 0.0, 'rpe_trans_median': 0.0,
-                'rpe_rot_mean': 0.0, 'rpe_rot_median': 0.0}
-
-    # Sort by image path for meaningful consecutive pairs
-    if image_paths is not None:
-        order = np.argsort(image_paths)
-        order_t = torch.tensor(order, dtype=torch.long)
-        pred_se3 = pred_se3[order_t]
-        gt_se3 = gt_se3[order_t]
-
-    # Consecutive pairs
-    gt_inv = torch.linalg.inv(gt_se3[1:])
-    rel_gt = gt_se3[:-1] @ gt_inv
-    pred_inv = torch.linalg.inv(pred_se3[1:])
-    rel_pred = pred_se3[:-1] @ pred_inv
-
-    # Relative pose error: E = rel_gt^{-1} @ rel_pred
-    rel_err = torch.linalg.inv(rel_gt) @ rel_pred  # (N-1, 4, 4)
-
-    # Translation error (Euclidean norm)
-    trans_err = torch.norm(rel_err[:, :3, 3], dim=1)
-
-    # Rotation error (angle from rotation matrix)
-    R_err = rel_err[:, :3, :3]
-    trace = R_err[:, 0, 0] + R_err[:, 1, 1] + R_err[:, 2, 2]
-    cos_angle = torch.clamp((trace - 1) / 2, -1.0, 1.0)
-    rot_err = torch.acos(cos_angle) * 180.0 / np.pi
-
-    return {
-        'rpe_trans_mean': float(trans_err.mean()),
-        'rpe_trans_median': float(trans_err.median()),
-        'rpe_rot_mean': float(rot_err.mean()),
-        'rpe_rot_median': float(rot_err.median()),
-    }
-
-
 def c2w_to_w2c(c2w):
     w2c = np.linalg.inv(c2w)
     return w2c[:3, :]
-
-
-# =============================================================================
-# Chunking quality metrics
-# =============================================================================
-
-def compute_chunking_quality_metrics(sim_matrix, chunks, gt_poses_c2w=None):
-    """Compute chunking quality metrics from similarity matrix and chunks.
-
-    Args:
-        sim_matrix: (N, N) numpy cosine similarity matrix.
-        chunks: list of K lists of frame indices.
-        gt_poses_c2w: (N, 4, 4) numpy c2w matrices, or None to skip GT-dependent metrics.
-
-    Returns:
-        dict of metric name → value.
-    """
-    from scipy import stats
-
-    N = sim_matrix.shape[0]
-    K = len(chunks)
-    sim = np.clip(sim_matrix, 0, None)
-
-    # --- Coverage per chunk: f_cov(C_k) = sum_i max_{j in C_k} sim(i,j) ---
-    per_chunk_cov = np.array([
-        sim[:, chunk].max(axis=1).sum() if len(chunk) > 0 else 0.0
-        for chunk in chunks
-    ])
-
-    # --- Coverage balance ---
-    coverage_profiles = np.zeros((K, N), dtype=np.float32)
-    for k, chunk in enumerate(chunks):
-        if len(chunk) > 0:
-            coverage_profiles[k] = sim[:, chunk].max(axis=1)
-    per_frame_var = float(coverage_profiles.var(axis=0).mean())
-    chunk_total_var = float(coverage_profiles.sum(axis=1).var())
-
-    # --- Intra-chunk diversity: mean pairwise distance within each chunk ---
-    diversities = []
-    for chunk in chunks:
-        if len(chunk) < 2:
-            diversities.append(0.0)
-            continue
-        chunk_sim = sim[np.ix_(chunk, chunk)]
-        triu_idx = np.triu_indices(len(chunk), k=1)
-        diversities.append(float(1.0 - chunk_sim[triu_idx].mean()))
-    diversity = np.array(diversities)
-
-    # --- Pair Utility Coverage: f_ucov(C_k) = sum_i max_{j in C_k} u(sim(i,j)) ---
-    alpha_metric = 0.7
-    sim_safe_m = np.clip(sim, 1e-8, 1.0 - 1e-8)
-    U_m = np.power(sim_safe_m, alpha_metric) * np.power(1.0 - sim_safe_m, 1.0 - alpha_metric)
-    np.fill_diagonal(U_m, 0.0)
-
-    per_chunk_ucov = np.array([
-        U_m[:, chunk].max(axis=1).sum() if len(chunk) > 0 else 0.0
-        for chunk in chunks
-    ])
-
-    # --- Within-chunk Pair Quality ---
-    pair_qualities = []
-    for chunk in chunks:
-        if len(chunk) < 2:
-            pair_qualities.append(0.0)
-            continue
-        chunk_U = U_m[np.ix_(chunk, chunk)]
-        triu_idx = np.triu_indices(len(chunk), k=1)
-        pair_qualities.append(float(chunk_U[triu_idx].mean()))
-    pair_quality = np.array(pair_qualities)
-
-    metrics = {
-        'coverage_mean': float(per_chunk_cov.mean()),
-        'coverage_std': float(per_chunk_cov.std()),
-        'coverage_min': float(per_chunk_cov.min()),
-        'per_frame_coverage_variance': per_frame_var,
-        'chunk_total_coverage_variance': chunk_total_var,
-        'diversity_mean': float(diversity.mean()),
-        'utility_coverage_mean': float(per_chunk_ucov.mean()),
-        'utility_coverage_min': float(per_chunk_ucov.min()),
-        'pair_quality_mean': float(pair_quality.mean()),
-        'pair_quality_min': float(pair_quality.min()),
-    }
-
-    # --- GT-dependent metrics (spatial coverage + overlap correlation) ---
-    if gt_poses_c2w is not None:
-        # Spatial coverage: voxelized camera position occupancy ratio
-        grid_resolution = 0.1
-        all_positions = gt_poses_c2w[:, :3, 3]
-        min_pos = all_positions.min(axis=0)
-        voxel_ids_all = ((all_positions - min_pos) / grid_resolution).astype(int)
-        total_voxels = len(set(map(tuple, voxel_ids_all)))
-
-        spatial_covs = []
-        for chunk in chunks:
-            if len(chunk) == 0:
-                spatial_covs.append(0.0)
-                continue
-            chunk_pos = all_positions[chunk]
-            voxel_ids = ((chunk_pos - min_pos) / grid_resolution).astype(int)
-            spatial_covs.append(len(set(map(tuple, voxel_ids))) / max(total_voxels, 1))
-        spatial_cov = np.array(spatial_covs)
-
-        metrics['spatial_coverage_mean'] = float(spatial_cov.mean())
-        metrics['spatial_coverage_std'] = float(spatial_cov.std())
-
-        # Overlap correlation: sim vs spatial proximity
-        positions = gt_poses_c2w[:, :3, 3]
-        directions = -gt_poses_c2w[:, :3, 2]
-
-        diff = positions[:, None, :] - positions[None, :, :]
-        trans_dist = np.linalg.norm(diff, axis=2)
-
-        dirs_norm = directions / (np.linalg.norm(directions, axis=1, keepdims=True) + 1e-8)
-        cos_ang = np.clip(dirs_norm @ dirs_norm.T, -1, 1)
-        ang_dist = np.arccos(cos_ang)
-
-        sigma_t = max(np.median(trans_dist[trans_dist > 0]), 1e-8)
-        sigma_a = max(np.median(ang_dist[ang_dist > 0]), 1e-8)
-        spatial_prox = np.exp(-trans_dist / sigma_t) * np.exp(-ang_dist / sigma_a)
-
-        triu_idx = np.triu_indices(N, k=1)
-        sim_flat = sim[triu_idx]
-        prox_flat = spatial_prox[triu_idx]
-
-        pearson_r, _ = stats.pearsonr(sim_flat, prox_flat)
-        spearman_r, _ = stats.spearmanr(sim_flat, prox_flat)
-
-        # Average Precision
-        fov_rad = np.deg2rad(60.0)
-        overlap_thresh = sigma_t * 0.5
-        trans_flat = trans_dist[triu_idx]
-        ang_flat = ang_dist[triu_idx]
-        overlap_binary = ((trans_flat < overlap_thresh) & (ang_flat < fov_rad)).astype(np.float32)
-
-        if 0 < overlap_binary.sum() < len(overlap_binary):
-            sorted_idx = np.argsort(-sim_flat)
-            sorted_labels = overlap_binary[sorted_idx]
-            cumsum = np.cumsum(sorted_labels)
-            precision_at_k = cumsum / np.arange(1, len(sorted_labels) + 1)
-            avg_precision = float((precision_at_k * sorted_labels).sum() / sorted_labels.sum())
-        else:
-            avg_precision = float('nan')
-
-        metrics['overlap_corr_pearson'] = float(pearson_r)
-        metrics['overlap_corr_spearman'] = float(spearman_r)
-        metrics['overlap_corr_ap'] = avg_precision
-
-    return metrics
 
 
 def umeyama_alignment(src, dst):
@@ -1243,40 +1021,6 @@ def evaluate_sequence(seq_dir, model, device, dtype, n_frames, thresholds,
         rta_np = rta.cpu().numpy()
         auc = calculate_auc(rra_np, rta_np, thresholds)
 
-        # Chunking quality metrics for both initial and rechunked
-        chunking_metrics_initial = None
-        chunking_metrics_rechunked = None
-        if sim_matrix is not None:
-            chunking_metrics_initial = compute_chunking_quality_metrics(
-                sim_matrix, initial_chunks, gt_c2w_arr)
-            chunking_metrics_rechunked = compute_chunking_quality_metrics(
-                sim_matrix, rechunked_chunks, gt_c2w_arr)
-
-        # Per-chunk evaluation
-        per_chunk_eval = []
-        if rechunked_chunks and len(rechunked_chunks) > 1:
-            for k, chunk_idx_list in enumerate(rechunked_chunks):
-                if len(chunk_idx_list) < 2:
-                    per_chunk_eval.append({
-                        'chunk_id': k, 'n_frames': len(chunk_idx_list),
-                        'auc': None, 'mean_rra': None, 'mean_rta': None,
-                    })
-                    continue
-                cidx = sorted(chunk_idx_list)
-                c_pred = pred_se3[cidx]
-                c_gt = gt_se3[cidx]
-                c_rra, c_rta = compute_relative_pose_errors(c_pred, c_gt, len(cidx))
-                c_rra_np = c_rra.cpu().numpy()
-                c_rta_np = c_rta.cpu().numpy()
-                c_auc = calculate_auc(c_rra_np, c_rta_np, thresholds)
-                per_chunk_eval.append({
-                    'chunk_id': k,
-                    'n_frames': len(cidx),
-                    'auc': c_auc,
-                    'mean_rra': float(np.mean(c_rra_np)),
-                    'mean_rta': float(np.mean(c_rta_np)),
-                })
-
         _pred_se3_np = pred_se3.cpu().numpy()
 
         del pred_se3, gt_ext, add_row, gt_se3, rra, rta
@@ -1289,17 +1033,10 @@ def evaluate_sequence(seq_dir, model, device, dtype, n_frames, thresholds,
             'n_frames': N,
             'n_total_frames': len(all_frames),
             'num_chunks': num_chunks,
-            'anchor': 0,
-            'anchors': [0],
+            'tau_used': tau_used,
             'timing': timing,
-            'chunking_metrics': chunking_metrics_rechunked,
-            'chunking_metrics_initial': chunking_metrics_initial,
             'rra': rra_np.tolist(),
             'rta': rta_np.tolist(),
-            'per_chunk_eval': per_chunk_eval,
-            'chunk_frame_indices': rechunked_chunks,
-            'initial_chunk_frame_indices': initial_chunks,
-            'tau_used': tau_used,
             'image_paths': image_paths,
             'pred_se3': _pred_se3_np,
             'gt_c2w': gt_c2w_arr,
@@ -1323,42 +1060,7 @@ def evaluate_sequence(seq_dir, model, device, dtype, n_frames, thresholds,
     rta_np = rta.cpu().numpy()
     auc = calculate_auc(rra_np, rta_np, thresholds)
 
-    # Per-chunk evaluation
-    per_chunk_eval = []
-    if chunk_frame_indices is not None and len(chunk_frame_indices) > 1:
-        for k, chunk_idx_list in enumerate(chunk_frame_indices):
-            if len(chunk_idx_list) < 2:
-                per_chunk_eval.append({
-                    'chunk_id': k, 'n_frames': len(chunk_idx_list),
-                    'auc': None, 'mean_rra': None, 'mean_rta': None,
-                })
-                continue
-            cidx = sorted(chunk_idx_list)
-            c_pred = pred_se3[cidx]
-            c_gt = gt_se3[cidx]
-            c_rra, c_rta = compute_relative_pose_errors(c_pred, c_gt, len(cidx))
-            c_rra_np = c_rra.cpu().numpy()
-            c_rta_np = c_rta.cpu().numpy()
-            c_auc = calculate_auc(c_rra_np, c_rta_np, thresholds)
-            per_chunk_eval.append({
-                'chunk_id': k,
-                'n_frames': len(cidx),
-                'auc': c_auc,
-                'mean_rra': float(np.mean(c_rra_np)),
-                'mean_rta': float(np.mean(c_rta_np)),
-            })
-
-    chunking_metrics = None
-    if sim_matrix is not None and chunk_frame_indices is not None:
-        gt_poses_c2w = np.stack([gt_c2w[i] for i in valid], axis=0)
-        chunking_metrics = compute_chunking_quality_metrics(
-            sim_matrix, chunk_frame_indices, gt_poses_c2w
-        )
-
-    # ATE / RPE metrics
     pred_se3_np = pred_se3.cpu().numpy()
-    ate_metrics = compute_ate_metrics(pred_se3_np, gt_c2w_arr)
-    rpe_metrics = compute_rpe_metrics(pred_se3, gt_se3, image_paths=image_paths)
 
     return {
         'auc': auc,
@@ -1367,16 +1069,9 @@ def evaluate_sequence(seq_dir, model, device, dtype, n_frames, thresholds,
         'n_frames': N,
         'n_total_frames': len(all_frames),
         'num_chunks': num_chunks,
-        'anchor': anchor,
-        'anchors': anchors,
         'timing': timing,
-        'chunking_metrics': chunking_metrics,
         'rra': rra_np.tolist(),
         'rta': rta_np.tolist(),
-        'ate': ate_metrics,
-        'rpe': rpe_metrics,
-        'per_chunk_eval': per_chunk_eval,
-        'chunk_frame_indices': chunk_frame_indices,
         'image_paths': image_paths,
         'pred_se3': pred_se3_np,
         'gt_c2w': gt_c2w_arr,
@@ -1394,7 +1089,6 @@ def run_evaluation(model, args, dtype, device, scenes, thresholds):
         all_results: dict of scene → {sequences, summary}
         global_summary: dict with global AUC
     """
-    mode_label = "baseline"
 
     all_results = {}
     global_rra = []
@@ -1403,7 +1097,7 @@ def run_evaluation(model, args, dtype, device, scenes, thresholds):
 
     for scene in scenes:
         print(f"\n{'='*60}")
-        print(f"Scene: {scene}  [mode={mode_label}]")
+        print(f"Scene: {scene}")
         print(f"{'='*60}")
 
         test_seqs = parse_split(args.dataset_dir, scene, split='test')
@@ -1472,30 +1166,6 @@ def run_evaluation(model, args, dtype, device, scenes, thresholds):
                   f"{chunk_info})")
             print(f"           {timing_str}")
 
-            # ATE / RPE metrics (shuffle modes)
-            if result.get('ate'):
-                ate = result['ate']
-                print(f"           [ATE] RMSE={ate['ate_rmse']:.4f}, "
-                      f"Mean={ate['ate_mean']:.4f}, Median={ate['ate_median']:.4f}, "
-                      f"Max={ate['ate_max']:.4f}  (scale={ate['scale']:.4f})")
-            if result.get('rpe'):
-                rpe = result['rpe']
-                print(f"           [RPE] Trans: Mean={rpe['rpe_trans_mean']:.4f}, "
-                      f"Median={rpe['rpe_trans_median']:.4f}  |  "
-                      f"Rot: Mean={rpe['rpe_rot_mean']:.2f}°, "
-                      f"Median={rpe['rpe_rot_median']:.2f}°")
-
-            # Per-chunk evaluation
-            if result.get('per_chunk_eval'):
-                for ce in result['per_chunk_eval']:
-                    if ce['auc'] is not None:
-                        ce_auc_str = ", ".join([f"AUC@{t}={ce['auc'][t]:.4f}" for t in thresholds])
-                        print(f"           Chunk {ce['chunk_id']} (n={ce['n_frames']:>3}): "
-                              f"{ce_auc_str}  "
-                              f"(RRA={ce['mean_rra']:.2f}, RTA={ce['mean_rta']:.2f})")
-                    else:
-                        print(f"           Chunk {ce['chunk_id']} (n={ce['n_frames']:>3}): too few frames")
-
             # Serialize timing
             timing_save = None
             if t is not None:
@@ -1509,15 +1179,8 @@ def run_evaluation(model, args, dtype, device, scenes, thresholds):
                 'n_frames': result['n_frames'],
                 'n_total_frames': result['n_total_frames'],
                 'num_chunks': result['num_chunks'],
-                'anchor': result.get('anchor'),
-                'anchors': result.get('anchors'),
-                'ate': result.get('ate'),
-                'rpe': result.get('rpe'),
                 'tau_used': result.get('tau_used'),
                 'timing': timing_save,
-                'chunking_metrics': result.get('chunking_metrics'),
-                'chunk_frame_indices': result.get('chunk_frame_indices'),
-                'per_chunk_eval': result.get('per_chunk_eval', []),
             }
             scene_rra.append(np.array(result['rra']))
             scene_rta.append(np.array(result['rta']))
@@ -1560,22 +1223,6 @@ def run_evaluation(model, args, dtype, device, scenes, thresholds):
             auc_str = ", ".join([f"AUC@{t}={scene_auc[t]:.4f}" for t in thresholds])
             print(f"  --- {scene} overall: {auc_str} "
                   f"(mean_rra={scene_summary['mean_rra']:.2f}, mean_rta={scene_summary['mean_rta']:.2f})")
-
-            # Aggregate ATE/RPE across sequences
-            seq_ate = [scene_results[s]['ate'] for s in scene_results if scene_results[s].get('ate')]
-            seq_rpe = [scene_results[s]['rpe'] for s in scene_results if scene_results[s].get('rpe')]
-            if seq_ate:
-                scene_ate = {k: float(np.mean([a[k] for a in seq_ate])) for k in seq_ate[0]}
-                scene_summary['ate'] = scene_ate
-                print(f"           [ATE] RMSE={scene_ate['ate_rmse']:.4f}, "
-                      f"Mean={scene_ate['ate_mean']:.4f}, Median={scene_ate['ate_median']:.4f}")
-            if seq_rpe:
-                scene_rpe = {k: float(np.mean([r[k] for r in seq_rpe])) for k in seq_rpe[0]}
-                scene_summary['rpe'] = scene_rpe
-                print(f"           [RPE] Trans: Mean={scene_rpe['rpe_trans_mean']:.4f}, "
-                      f"Median={scene_rpe['rpe_trans_median']:.4f}  |  "
-                      f"Rot: Mean={scene_rpe['rpe_rot_mean']:.2f}°, "
-                      f"Median={scene_rpe['rpe_rot_median']:.2f}°")
 
             if scene_timings:
                 # Avg timing across sequences (same format as nrgbd/bonn)
@@ -1629,29 +1276,7 @@ def run_evaluation(model, args, dtype, device, scenes, thresholds):
             'per_scene': {s: scene_aucs[s] for s in scene_aucs},
         }
         auc_str = ", ".join([f"AUC@{t}={global_auc[t]:.4f}" for t in thresholds])
-        print(f"\n  [{mode_label}] GLOBAL: {auc_str}  ({len(scene_aucs)} scenes)")
-
-        # Global ATE/RPE (mean of per-scene means)
-        scene_ates = {s: all_results[s]['summary'].get('ate')
-                      for s in all_results if all_results[s]['summary'] is not None
-                      and all_results[s]['summary'].get('ate') is not None}
-        scene_rpes = {s: all_results[s]['summary'].get('rpe')
-                      for s in all_results if all_results[s]['summary'] is not None
-                      and all_results[s]['summary'].get('rpe') is not None}
-        if scene_ates:
-            global_ate = {k: float(np.mean([scene_ates[s][k] for s in scene_ates]))
-                          for k in list(scene_ates.values())[0]}
-            global_summary['ate'] = global_ate
-            print(f"           [ATE] RMSE={global_ate['ate_rmse']:.4f}, "
-                  f"Mean={global_ate['ate_mean']:.4f}, Median={global_ate['ate_median']:.4f}")
-        if scene_rpes:
-            global_rpe = {k: float(np.mean([scene_rpes[s][k] for s in scene_rpes]))
-                          for k in list(scene_rpes.values())[0]}
-            global_summary['rpe'] = global_rpe
-            print(f"           [RPE] Trans: Mean={global_rpe['rpe_trans_mean']:.4f}, "
-                  f"Median={global_rpe['rpe_trans_median']:.4f}  |  "
-                  f"Rot: Mean={global_rpe['rpe_rot_mean']:.2f}°, "
-                  f"Median={global_rpe['rpe_rot_median']:.2f}°")
+        print(f"\n  GLOBAL: {auc_str}  ({len(scene_aucs)} scenes)")
 
         if global_timings:
             timing_keys = ['total', 'dino', 'sampling_sim', 'sampling_fl', 'sampling_ls', 'sampling_init', 'sampling_total',
@@ -1739,31 +1364,22 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'#'*60}")
-    print(f"# VGGT Chunked Inference (sampling={args.sampling_method})")
+    print(f"# VGGT Chunked Pose Eval (7-Scenes, sampling={args.sampling_method})")
     print(f"# n_frames={args.n_frames}, chunk_size={args.chunk_size}")
     if args.sampling_method == "da_partitioning":
-        print(f"# pose-weighted re-chunking: "
-              f"gamma={args.gamma}, tau={args.tau}, epsilon={args.epsilon}")
-        if args.rechunk_remaining_only:
-            print(f"# rechunk_remaining_only=True")
+        print(f"# pose-weighted re-chunking: gamma={args.gamma}, tau={args.tau}, "
+              f"epsilon={args.epsilon}, rechunk_remaining_only={args.rechunk_remaining_only}")
     print(f"{'#'*60}\n")
 
     results, summary = run_evaluation(model, args, dtype, device, scenes, thresholds)
-    mode_names = ["baseline"]
-    all_mode_results = {"baseline": results}
-    all_mode_summaries = {"baseline": summary}
 
     # Save results
     save_data = {
         'args': vars(args),
         'timestamp': datetime.now().isoformat(),
-        'modes': {},
+        'scenes': results,
+        'global_summary': summary,
     }
-    for mode_name in mode_names:
-        save_data['modes'][mode_name] = {
-            'scenes': all_mode_results[mode_name],
-            'global_summary': all_mode_summaries[mode_name],
-        }
 
     pair_suffix = f"_ls{args.local_search_iters}" if args.sampling_method == "da_partitioning" else ""
     anchor_suffix = "first_anchor"
@@ -1777,11 +1393,11 @@ def main():
     name_core = (f"{args.sampling_method}_n{args.n_frames}_c{args.chunk_size}"
                  f"_l0.0{pair_suffix}{anchor_suffix}{pw_suffix}")
     if args.scenes:
-        json_path = output_dir / f"chunked_{args.scenes[0]}_{name_core}.json"
+        json_path = output_dir / f"chunked_pose_{args.scenes[0]}_{name_core}.json"
     else:
-        json_path = output_dir / f"chunked_{name_core}.json"
+        json_path = output_dir / f"chunked_pose_{name_core}.json"
     with open(json_path, 'w') as f:
-        json.dump(save_data, f, indent=2)
+        json.dump(save_data, f, indent=2, default=str)
     print(f"\nResults saved to {json_path}")
 
 

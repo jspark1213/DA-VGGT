@@ -1035,12 +1035,11 @@ def main():
         model.aggregator.sampling_max_frames = 0
 
     print(f"\n{'#'*60}")
-    print(f"# VGGT Chunked 3D Eval (7-Scenes, method={args.sampling_method})")
+    print(f"# VGGT Chunked 3D Eval (7-Scenes, sampling={args.sampling_method})")
     print(f"# n_frames={args.n_frames}, chunk_size={args.chunk_size}")
     print(f"# dtype={args.dtype}, conf_thresh={args.conf_thresh}")
     if args.sampling_method == "da_partitioning":
-        print(f"# pose-weighted re-chunking: "
-              f"gamma={args.gamma}, tau={args.tau}, "
+        print(f"# pose-weighted re-chunking: gamma={args.gamma}, tau={args.tau}, "
               f"epsilon={args.epsilon}, rechunk_remaining_only={args.rechunk_remaining_only}")
     print(f"{'#'*60}\n")
 
@@ -1128,20 +1127,20 @@ def main():
     name_core = (f"{args.sampling_method}_n{args.n_frames}_c{args.chunk_size}"
                  f"_l0.0{pair_suffix}{anchor_suffix}{pw_suffix}")
     if args.scenes:
-        json_name = f"chunked3d_{args.scenes[0]}_{name_core}.json"
+        json_name = f"chunked_3d_{args.scenes[0]}_{name_core}.json"
     else:
-        json_name = f"chunked3d_{name_core}.json"
+        json_name = f"chunked_3d_{name_core}.json"
     json_path = output_dir / json_name
 
     save_data = {
         'args': vars(args),
         'timestamp': datetime.now().isoformat(),
-        'scene_summaries': scene_summaries,
-        'overall_mean': overall,
+        'scenes': scene_summaries,
+        'global_summary': overall,
     }
     with open(json_path, 'w') as f:
         json.dump(save_data, f, indent=2, default=str)
-    print(f'\nResults saved → {json_path}')
+    print(f"\nResults saved to {json_path}")
 
 
 if __name__ == "__main__":
