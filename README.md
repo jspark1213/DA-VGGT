@@ -1,7 +1,7 @@
 <h1 align="center">Diversity-Aware View Partitioning for Scalable VGGT</h1>
 
 <p align="center">
-  <a href="#"><img src="https://img.shields.io/badge/arXiv-TBD-b31b1b?logo=arxiv&logoColor=white" alt="arXiv"></a>
+  <a href="https://arxiv.org/abs/2607.01885"><img src="https://img.shields.io/badge/arXiv-2607.01885-b31b1b?logo=arxiv&logoColor=white" alt="arXiv"></a>
   <a href="https://jspark1213.github.io/DA-VGGT/"><img src="https://img.shields.io/badge/Project_Page-DA--VGGT-2088c1" alt="Project Page"></a>
 </p>
 
@@ -141,5 +141,13 @@ both projects for releasing their code.
 If you find this work useful, please consider citing:
 
 ```bibtex
-TBD
+@misc{park2026diversityawareviewpartitioningscalable,
+  title         = {Diversity-aware View Partitioning for Scalable VGGT},
+  author        = {Jinsoo Park and Donggyu Choi and Ahyun Seo and Minsu Cho and Jeany Son},
+  year          = {2026},
+  eprint        = {2607.01885},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CV},
+  url           = {https://arxiv.org/abs/2607.01885}
+}
 ```
