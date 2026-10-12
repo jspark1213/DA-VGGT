@@ -142,13 +142,12 @@ both projects for releasing their code.
 If you find this work useful, please consider citing:
 
 ```bibtex
-@misc{park2026diversityawareviewpartitioningscalable,
-  title         = {Diversity-aware View Partitioning for Scalable VGGT},
-  author        = {Jinsoo Park and Donggyu Choi and Ahyun Seo and Minsu Cho and Jeany Son},
-  year          = {2026},
-  eprint        = {2607.01885},
-  archivePrefix = {arXiv},
-  primaryClass  = {cs.CV},
-  url           = {https://arxiv.org/abs/2607.01885}
+@inproceedings{park2026diversity,
+  title={Diversity-Aware View Partitioning for Scalable VGGT},
+  author={Park, Jinsoo and Choi, Donggyu and Seo, Ahyun and Cho, Minsu and Son, Jeany},
+  booktitle={European Conference on Computer Vision},
+  pages={547--564},
+  year={2026},
+  organization={Springer}
 }
 ```
