@@ -1,18 +1,16 @@
-#!/bin/bash
-# 7-Scenes 3D-reconstruction evaluation
-# Method: da_partitioning (diversity-aware) + pose-weighted re-chunking (gamma=0.001, eps=0.005)
-set -e
-cd "$(dirname "$0")"   # repo root
+#!/usr/bin/env bash
+# Paper setting: 500 frames, 50-frame DA partitions, reuse chunk 0.
+set -euo pipefail
+cd "$(dirname "$0")"
 
-DATASET_DIR=/path/to/7scenes
-OUTPUT_DIR=./results/3d_7scenes
-export CUDA_VISIBLE_DEVICES=0
+DATASET_DIR="${DATASET_DIR:-/path/to/7scenes}"
+OUTPUT_DIR="${OUTPUT_DIR:-./results/3d_7scenes}"
+PYTHON="${PYTHON:-python}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
-python eval/eval_chunked_3d_7scenes.py \
+"$PYTHON" eval/eval_chunked_3d_7scenes.py \
     --dataset_dir "$DATASET_DIR" \
-    --n_frames 500 \
-    --chunk_size 50 \
-    --sampling_method da_partitioning \
-    --local_search_iters 5 \
+    --n_frames 500 --chunk_size 50 \
+    --sampling_method da_partitioning --local_search_iters 5 \
     --rechunk_remaining_only \
-    --output_dir "$OUTPUT_DIR"
+    --output_dir "$OUTPUT_DIR" "$@"

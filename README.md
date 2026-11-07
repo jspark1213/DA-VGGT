@@ -25,7 +25,7 @@ dispersion. This lets the transformer focus attention on geometrically
 informative views while reducing redundant attention, improving camera pose
 estimation, multi-view depth prediction, and 3D reconstruction at lower memory
 and latency. This repository provides the code to reproduce the main
-evaluations on 7-Scenes (pose, 3D) and Bonn (depth).
+evaluations on ScanNet-50, 7-Scenes and NRGBD (3D), 7-Scenes (pose), and Bonn (depth).
 
 ## News
 
@@ -37,10 +37,16 @@ evaluations on 7-Scenes (pose, 3D) and Bonn (depth).
 ```
 eval_pose_7scenes.sh             # run: 7-Scenes camera-pose evaluation
 eval_3d_7scenes.sh               # run: 7-Scenes 3D-reconstruction evaluation
+eval_3d_scannet.sh               # run: ScanNet-50 3D-reconstruction evaluation
+eval_3d_nrgbd.sh                 # run: NRGBD 3D-reconstruction evaluation
 eval_depth_bonn.sh               # run: Bonn RGB-D depth evaluation
 eval/
   eval_chunked_pose_7scenes.py   # 7-Scenes camera-pose evaluation
   eval_chunked_3d_7scenes.py     # 7-Scenes 3D-reconstruction evaluation
+  eval_chunked_3d_scannet.py     # ScanNet-50 3D-reconstruction evaluation
+  scannet50_scenes.txt          # exact 50 input scenes for Table 3
+  eval_chunked_3d_nrgbd.py       # NRGBD 3D-reconstruction evaluation
+  recon_{data,metrics,inference,eval}.py # shared reconstruction implementation
   eval_chunked_depth_bonn.py     # Bonn RGB-D depth evaluation
 requirements.txt                 # python dependencies
 vggt/                            # VGGT model package (incl. our aggregator splits)
@@ -63,6 +69,8 @@ One launcher script per evaluation lives at the repo root. Edit `DATASET_DIR` /
 ```bash
 bash eval_pose_7scenes.sh    # 7-Scenes camera pose
 bash eval_3d_7scenes.sh      # 7-Scenes 3D reconstruction
+bash eval_3d_scannet.sh      # ScanNet-50 3D reconstruction
+bash eval_3d_nrgbd.sh        # NRGBD 3D reconstruction
 bash eval_depth_bonn.sh      # Bonn RGB-D depth
 ```
 
@@ -90,7 +98,7 @@ random_partitioning` (random partitioning without local search) and `origin`
 ## Options
 
 The CLI is intentionally minimal — only the knobs needed to reproduce the paper
-are exposed. All three scripts share a common core; the 3D and depth scripts add
+are exposed. The evaluation scripts share common options; the 3D and depth scripts add
 a few task-specific options.
 
 **Common (all scripts)**
@@ -118,7 +126,11 @@ a few task-specific options.
 | `--epsilon` | `0.005` | ε for the appearance−ε·pose score combination |
 | `--rechunk_remaining_only` | off | Freeze chunk-0 and re-chunk only the remaining frames |
 
-**3D-only** (`eval_chunked_3d_7scenes.py`): `--conf_thresh`, `--export_ply`, `--ply_dir`.
+**3D-only** (all three datasets): `--conf_thresh`, `--export_ply`, `--ply_dir`,
+`--device`, `--dry_run`. Reconstruction defaults to **500 frames** and
+`--rechunk_remaining_only`; `--no-rechunk_remaining_only` disables chunk-0 reuse.
+`--model_path` accepts a PyTorch checkpoint, a `.safetensors` file, or a local
+Hugging Face model directory. PLY output is only written with `--export_ply`.
 **Depth-only** (`eval_chunked_depth_bonn.py`): `--min_depth`, `--max_depth`.
 
 Cross-chunk alignment is single-anchor rigid **SE3** (no scale). The
@@ -126,6 +138,68 @@ score-combination and pseudo-pose pipeline have a single fixed configuration; th
 various ablation knobs used during development (alternative samplers, combine
 modes, multi-anchor / Sim3 alignment, oracle GT pose-weighting, τ/rotation
 sweeps) are not part of this release.
+
+## 3D reconstruction
+
+The three entry points use the same evaluator: uniform frame selection, GT
+depth in meters, a central 224×224 crop, paired Sim(3) alignment using up to
+30,000 points, paired subsampling to at most 999,999 points, and rigid
+point-to-point ICP with a 0.1 m threshold. Acc and Comp are mean nearest-neighbor
+distances in meters; `cd=(acc+comp)/2`, `cd_sum=acc+comp`, and `nc=(nc1+nc2)/2`.
+The summary averages sequences equally for 7-Scenes and scenes equally for
+ScanNet/NRGBD. RGB is processed with the repository's VGGT preprocessor; GT
+depth uses nearest-neighbor resizing and scaled intrinsics.
+
+Expected dataset layouts:
+
+```text
+scannet/
+  train/scene0000_00/
+    color/0.jpg  depth/0.png  pose/0.txt
+    intrinsic/intrinsic_depth.txt
+7scenes/chess/
+  TestSplit.txt
+  seq-03/frame-000000.color.png
+  seq-03/frame-000000.depth.proj.png   # projected depth, uint16 millimeters
+  seq-03/frame-000000.pose.txt         # OpenCV camera-to-world
+nrgbd/kitchen/
+  images/img0.png  depth/depth0.png    # uint16 millimeters
+  poses.txt                          # OpenGL camera-to-world; converted on load
+```
+
+The exact 50 input scenes for **ScanNet-50 (Table 3)** are listed in
+[`eval/scannet50_scenes.txt`](eval/scannet50_scenes.txt), in evaluation order.
+The ScanNet evaluator uses this list by default. Paths are relative to
+`--dataset_dir`; both `train/scene*/` / `val/scene*/` and flat `scene*/` exports
+are supported. To use a different list, pass `--scene_list /path/to/test_seq.txt`.
+`--num_scenes` limits the list (default 50), and `--scenes` selects individual
+scenes. 7-Scenes also accepts a sequence such as `chess/seq-03`.
+
+```bash
+# Validate the dataset and save exact selected frame IDs without loading a model.
+python eval/eval_chunked_3d_scannet.py \
+  --dataset_dir /path/to/scannet --dry_run
+
+# Launchers accept environment overrides and additional evaluator options.
+DATASET_DIR=/path/to/scannet CUDA_VISIBLE_DEVICES=0 \
+  bash eval_3d_scannet.sh --model_path /path/to/VGGT-1B/model.safetensors
+DATASET_DIR=/path/to/7scenes bash eval_3d_7scenes.sh
+DATASET_DIR=/path/to/nrgbd bash eval_3d_nrgbd.sh
+
+# A short execution check on one scene, including PLY export.
+python eval/eval_chunked_3d_scannet.py \
+  --dataset_dir /path/to/scannet --scenes train/scene0000_00 \
+  --n_frames 4 --chunk_size 3 --export_ply
+```
+
+Each run writes a frame manifest and a results JSON under `--output_dir`,
+including evaluation settings, per-sequence metrics, failures, inference time,
+and peak allocated VRAM. Partial results are saved after every sequence; any
+failed sequence gives a nonzero exit status. Use separate output directories
+for separate experiment configurations. `--dry_run` checks frame paths and
+poses; image decoding is checked during evaluation.
+
+CPU validation: `python -m unittest discover -s eval/tests -v`.
 
 ## Acknowledgements
 
